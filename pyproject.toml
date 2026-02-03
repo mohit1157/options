@@ -1,0 +1,9 @@
+[project]
+name = "autonomous-trading-bot"
+version = "0.1.0"
+description = "Event-driven autonomous trading bot scaffold: Alpaca + X/RSS ingestion + sentiment adapters"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.ruff]
+line-length = 100
