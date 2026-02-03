@@ -50,3 +50,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# SQLite WAL files
+*.sqlite3-shm
+*.sqlite3-wal

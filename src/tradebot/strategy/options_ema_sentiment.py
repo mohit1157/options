@@ -258,4 +258,5 @@ class OptionsEmaSentimentStrategy:
             strike_tolerance=self.settings.option_strike_tolerance,
             dte_max=self.settings.option_dte_max,
             preferred_type=preferred_type,
+            client=contracts_client,  # Pass client for volume-based selection
         )
