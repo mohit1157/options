@@ -75,6 +75,34 @@ class TestSettingsValidation:
         with pytest.raises(ValueError, match="must be >= 1"):
             Settings(option_order_qty=0)
 
+    def test_pop_pullback_hold_candles_range(self):
+        """Test hold_candles_required accepts 1 or 2."""
+        Settings(pop_pullback_hold_candles_required=1)
+        Settings(pop_pullback_hold_candles_required=2)
+        with pytest.raises(ValueError, match="hold_candles_required"):
+            Settings(pop_pullback_hold_candles_required=3)
+
+    def test_pop_pullback_target_profit_range(self):
+        """Test pop_pullback_target_profit_pct is in [0.06, 0.08]."""
+        Settings(pop_pullback_target_profit_pct=0.06)
+        Settings(pop_pullback_target_profit_pct=0.08)
+        with pytest.raises(ValueError, match="pop_pullback_target_profit_pct"):
+            Settings(pop_pullback_target_profit_pct=0.05)
+
+    def test_pop_pullback_exit_mode_valid(self):
+        """Test pop_pullback_ema_exit_mode valid values."""
+        Settings(pop_pullback_ema_exit_mode="close")
+        Settings(pop_pullback_ema_exit_mode="intrabar")
+        with pytest.raises(ValueError, match="pop_pullback_ema_exit_mode"):
+            Settings(pop_pullback_ema_exit_mode="bad")
+
+    def test_pop_pullback_stop_buffer_mode_valid(self):
+        """Test stop buffer mode validation."""
+        Settings(pop_pullback_stop_buffer_mode="price")
+        Settings(pop_pullback_stop_buffer_mode="percent")
+        with pytest.raises(ValueError, match="stop_buffer_mode"):
+            Settings(pop_pullback_stop_buffer_mode="ticks")
+
     def test_symbols_list_property(self):
         """Test symbols_list property parses correctly."""
         settings = Settings(symbols="SPY,QQQ,AAPL")

@@ -24,6 +24,8 @@ def _tf(tf: str) -> TimeFrame:
     t = tf.lower()
     if t in ("1min", "1m", "1"):
         return TimeFrame.Minute
+    if t in ("3min", "3m", "3"):
+        return TimeFrame(3, TimeFrame.Unit.Minute)
     if t in ("5min", "5m", "5"):
         return TimeFrame(5, TimeFrame.Unit.Minute)
     if t in ("15min", "15m", "15"):

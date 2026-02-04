@@ -31,6 +31,17 @@ class Settings(BaseSettings):
     ema_slow: int = 21
     sentiment_threshold: float = 0.15
 
+    # Pop/Pullback EMA strategy parameters
+    pop_pullback_ema_length: int = 9
+    pop_pullback_hold_candles_required: int = 2
+    pop_pullback_strength_filter: bool = False
+    pop_pullback_stop_buffer: float = 0.0
+    pop_pullback_stop_buffer_mode: str = "price"  # "price" or "percent"
+    pop_pullback_target_profit_pct: float = 0.07
+    pop_pullback_entry_timeout_candles: int = 3
+    pop_pullback_ema_exit_mode: str = "close"  # "close" or "intrabar"
+    pop_pullback_profit_calc_on_underlying: bool = True
+
     # Risk parameters
     max_daily_loss_usd: float = 250.0
     max_position_value_usd: float = 2000.0
@@ -143,6 +154,57 @@ class Settings(BaseSettings):
         if v <= 0 or v > 1:
             raise ValueError(f"{info.field_name} must be in (0, 1], got {v}")
         return v
+
+    @field_validator("pop_pullback_ema_length")
+    @classmethod
+    def pop_pullback_ema_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"pop_pullback_ema_length must be >= 1, got {v}")
+        return v
+
+    @field_validator("pop_pullback_hold_candles_required")
+    @classmethod
+    def pop_pullback_hold_range(cls, v: int) -> int:
+        if v not in (1, 2):
+            raise ValueError("pop_pullback_hold_candles_required must be 1 or 2")
+        return v
+
+    @field_validator("pop_pullback_stop_buffer")
+    @classmethod
+    def pop_pullback_stop_buffer_non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"pop_pullback_stop_buffer must be >= 0, got {v}")
+        return v
+
+    @field_validator("pop_pullback_stop_buffer_mode")
+    @classmethod
+    def pop_pullback_stop_buffer_mode_valid(cls, v: str) -> str:
+        v_lower = v.lower().strip()
+        if v_lower not in ("price", "percent"):
+            raise ValueError("pop_pullback_stop_buffer_mode must be 'price' or 'percent'")
+        return v_lower
+
+    @field_validator("pop_pullback_target_profit_pct")
+    @classmethod
+    def pop_pullback_target_profit_range(cls, v: float) -> float:
+        if v < 0.06 or v > 0.08:
+            raise ValueError("pop_pullback_target_profit_pct must be in [0.06, 0.08]")
+        return v
+
+    @field_validator("pop_pullback_entry_timeout_candles")
+    @classmethod
+    def pop_pullback_entry_timeout_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("pop_pullback_entry_timeout_candles must be >= 1")
+        return v
+
+    @field_validator("pop_pullback_ema_exit_mode")
+    @classmethod
+    def pop_pullback_ema_exit_mode_valid(cls, v: str) -> str:
+        v_lower = v.lower().strip()
+        if v_lower not in ("close", "intrabar"):
+            raise ValueError("pop_pullback_ema_exit_mode must be 'close' or 'intrabar'")
+        return v_lower
 
     @field_validator("symbols")
     @classmethod
