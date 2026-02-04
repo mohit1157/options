@@ -54,6 +54,15 @@ def _run_cleanup() -> None:
     log.info("Cleanup complete.")
 
 
+def _extract_tweet_id(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    parts = url.rstrip("/").split("/")
+    if not parts:
+        return None
+    return parts[-1] if parts[-1].isdigit() else None
+
+
 def _make_sentiment(settings: Settings) -> SentimentClient:
     """Create sentiment client based on configuration."""
     if settings.grok_api_key:
@@ -161,6 +170,8 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
     # Initialize strategies
     strategy = EmaSentimentStrategy(settings=settings, broker=broker, risk=risk, store=store)
     opt_strategy = OptionsEmaSentimentStrategy(settings=settings, broker=broker, risk=risk, store=store)
+    if hasattr(opt_strategy, "close"):
+        _register_cleanup(opt_strategy.close)
 
     # Initialize X client if configured
     x_client = None
@@ -235,7 +246,12 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
                 try:
                     for handle in settings.x_handles_list:
                         try:
-                            tweets = x_client.fetch_recent_by_username(handle, max_results=5)
+                            since_id = store.get_x_since_id(handle)
+                            tweets = x_client.fetch_recent_by_username(
+                                handle,
+                                max_results=5,
+                                since_id=since_id,
+                            )
                             for t in tweets:
                                 if store.event_exists(url=t.url):
                                     continue
@@ -263,6 +279,17 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
                                     pass
                                 except Exception as ex:
                                     log.warning(f"Sentiment failed for tweet: {ex}")
+
+                            # Update since_id if we received any tweets
+                            if tweets:
+                                tweet_ids = [
+                                    _extract_tweet_id(t.url)
+                                    for t in tweets
+                                    if _extract_tweet_id(t.url)
+                                ]
+                                if tweet_ids:
+                                    # Use the max ID as since_id
+                                    store.set_x_since_id(handle, max(tweet_ids))
                         except Exception as ex:
                             log.warning(f"Failed to fetch tweets for @{handle}: {ex}")
                 except Exception as ex:

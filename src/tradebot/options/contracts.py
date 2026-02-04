@@ -138,6 +138,81 @@ class AlpacaOptionsContractsClient:
 
         return volumes
 
+    def get_latest_option_quote(self, symbol: str) -> Optional[dict]:
+        """Fetch the latest quote for an option symbol."""
+        url = f"{self.DATA_API_URL}/v1beta1/options/quotes"
+        params = {
+            "symbols": symbol,
+            "limit": 1,
+        }
+
+        r = self.client.get(url, params=params)
+
+        if r.status_code in (404, 422):
+            return None
+
+        r.raise_for_status()
+        data = r.json()
+        quotes = data.get("quotes", {})
+        sym_quotes = quotes.get(symbol) or quotes.get(symbol.upper())
+
+        if not sym_quotes:
+            return None
+
+        q = sym_quotes[-1]
+        bid = q.get("bp") or q.get("bid_price") or q.get("bid")
+        ask = q.get("ap") or q.get("ask_price") or q.get("ask")
+
+        if bid is None or ask is None:
+            return None
+
+        try:
+            return {"bid": float(bid), "ask": float(ask)}
+        except (TypeError, ValueError):
+            return None
+
+    def _get_latest_option_bar_close(self, symbol: str) -> Optional[float]:
+        """Fetch the latest bar close for an option symbol."""
+        url = f"{self.DATA_API_URL}/v1beta1/options/bars"
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        params = {
+            "symbols": symbol,
+            "timeframe": "1Min",
+            "start": today,
+            "limit": 1,
+        }
+
+        r = self.client.get(url, params=params)
+
+        if r.status_code in (404, 422):
+            return None
+
+        r.raise_for_status()
+        data = r.json()
+        bars = data.get("bars", {})
+        sym_bars = bars.get(symbol) or bars.get(symbol.upper())
+
+        if not sym_bars:
+            return None
+
+        bar = sym_bars[-1]
+        close = bar.get("c") or bar.get("close")
+        try:
+            return float(close)
+        except (TypeError, ValueError):
+            return None
+
+    def get_latest_option_mid_price(self, symbol: str) -> Optional[float]:
+        """Get a best-effort mid price for an option symbol."""
+        quote = self.get_latest_option_quote(symbol)
+        if quote:
+            bid = quote.get("bid")
+            ask = quote.get("ask")
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                return (bid + ask) / 2.0
+
+        return self._get_latest_option_bar_close(symbol)
+
     def _fetch_volume_batch(self, symbols: list[str]) -> dict[str, int]:
         """Fetch volume for a batch of symbols."""
         # Use options trades endpoint for volume

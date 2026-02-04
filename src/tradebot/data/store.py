@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +58,7 @@ class SQLiteStore:
                     author TEXT,
                     url TEXT,
                     url_hash TEXT UNIQUE,
+                    content_hash TEXT,
                     text TEXT NOT NULL,
                     ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -67,6 +69,12 @@ class SQLiteStore:
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_events_url_hash ON events(url_hash);
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_events_content_hash
+                ON events(content_hash) WHERE content_hash IS NOT NULL;
                 """
             )
             conn.execute(
@@ -123,7 +131,21 @@ class SQLiteStore:
                 """
             )
 
+            # X ingestion state table
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS x_state (
+                    username TEXT PRIMARY KEY,
+                    since_id TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+
             log.debug("Database schema initialized")
+
+            # Handle schema upgrades for existing DBs
+            self._ensure_column(conn, "events", "content_hash", "TEXT")
 
     def _compute_url_hash(self, url: Optional[str]) -> Optional[str]:
         """Compute a hash for URL deduplication."""
@@ -131,31 +153,66 @@ class SQLiteStore:
             return None
         return hashlib.sha256(url.encode()).hexdigest()[:32]
 
-    def event_exists(self, url: Optional[str] = None, url_hash: Optional[str] = None) -> bool:
+    def _compute_content_hash(
+        self,
+        *,
+        source: str,
+        author: Optional[str],
+        text: str,
+    ) -> Optional[str]:
+        """Compute a content hash for deduplication when URL is missing."""
+        if not text:
+            return None
+        payload = f"{source}|{author or ''}|{text[:1000]}"
+        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
+        """Ensure a column exists; add it if missing (for migrations)."""
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        cols = {row[1] for row in cur.fetchall()}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
+    def event_exists(
+        self,
+        url: Optional[str] = None,
+        url_hash: Optional[str] = None,
+        content_hash: Optional[str] = None,
+    ) -> bool:
         """Check if an event with the given URL already exists.
 
         Args:
             url: Event URL to check
             url_hash: Pre-computed URL hash (optional)
+            content_hash: Pre-computed content hash (optional)
 
         Returns:
             True if event exists
         """
-        if url is None and url_hash is None:
+        if url is None and url_hash is None and content_hash is None:
             return False
 
         if url_hash is None:
             url_hash = self._compute_url_hash(url)
 
-        if url_hash is None:
+        if content_hash is None and url_hash is None:
             return False
 
         with self.connect() as conn:
-            cur = conn.execute(
-                "SELECT 1 FROM events WHERE url_hash = ? LIMIT 1",
-                (url_hash,),
-            )
-            return cur.fetchone() is not None
+            if url_hash is not None:
+                cur = conn.execute(
+                    "SELECT 1 FROM events WHERE url_hash = ? LIMIT 1",
+                    (url_hash,),
+                )
+                if cur.fetchone() is not None:
+                    return True
+            if content_hash is not None:
+                cur = conn.execute(
+                    "SELECT 1 FROM events WHERE content_hash = ? LIMIT 1",
+                    (content_hash,),
+                )
+                return cur.fetchone() is not None
+            return False
 
     def add_event(
         self,
@@ -173,9 +230,16 @@ class SQLiteStore:
             Event ID if added, None if duplicate
         """
         url_hash = self._compute_url_hash(url)
+        content_hash = self._compute_content_hash(
+            source=source,
+            author=author,
+            text=text,
+        )
 
         # Check for duplicate
-        if url_hash and self.event_exists(url_hash=url_hash):
+        if (url_hash and self.event_exists(url_hash=url_hash)) or (
+            content_hash and self.event_exists(content_hash=content_hash)
+        ):
             log.debug(f"Duplicate event skipped: {url}")
             return None
 
@@ -183,8 +247,8 @@ class SQLiteStore:
             try:
                 cur = conn.execute(
                     """
-                    INSERT INTO events(type, source, created_at, author, url, url_hash, text)
-                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO events(type, source, created_at, author, url, url_hash, content_hash, text)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         type,
@@ -193,6 +257,7 @@ class SQLiteStore:
                         author,
                         url,
                         url_hash,
+                        content_hash,
                         text,
                     ),
                 )
@@ -222,6 +287,7 @@ class SQLiteStore:
         *,
         since_iso: str,
         limit: int = 50,
+        symbol: Optional[str] = None,
     ) -> list[Tuple[float, str, str]]:
         """Get recent sentiment scores.
 
@@ -229,17 +295,35 @@ class SQLiteStore:
             List of (score, label, source) tuples
         """
         with self.connect() as conn:
-            cur = conn.execute(
-                """
-                SELECT s.score, s.label, e.source
-                FROM sentiment s
-                JOIN events e ON e.id = s.event_id
-                WHERE s.created_at >= ?
-                ORDER BY s.created_at DESC
-                LIMIT ?
-                """,
-                (since_iso, limit),
-            )
+            if symbol:
+                sym = symbol.upper()
+                cur = conn.execute(
+                    """
+                    SELECT s.score, s.label, e.source
+                    FROM sentiment s
+                    JOIN events e ON e.id = s.event_id
+                    WHERE s.created_at >= ?
+                      AND (
+                        UPPER(e.text) LIKE ?
+                        OR UPPER(e.text) LIKE ?
+                      )
+                    ORDER BY s.created_at DESC
+                    LIMIT ?
+                    """,
+                    (since_iso, f"%{sym}%", f"%${sym}%", limit),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT s.score, s.label, e.source
+                    FROM sentiment s
+                    JOIN events e ON e.id = s.event_id
+                    WHERE s.created_at >= ?
+                    ORDER BY s.created_at DESC
+                    LIMIT ?
+                    """,
+                    (since_iso, limit),
+                )
             return list(cur.fetchall())
 
     def cleanup_old_events(self, hours: int = 24) -> int:
@@ -330,8 +414,6 @@ class SQLiteStore:
         Returns:
             Audit log ID
         """
-        import json
-
         with self.connect() as conn:
             cur = conn.execute(
                 """
@@ -364,8 +446,6 @@ class SQLiteStore:
         Returns:
             List of trade audit records
         """
-        import json
-
         query = "SELECT * FROM trade_audit WHERE 1=1"
         params = []
 
@@ -426,3 +506,71 @@ class SQLiteStore:
                 "rejected": row[2] or 0,
                 "errors": row[3] or 0,
             }
+
+    def get_last_trade_time(self, symbol: str) -> Optional[datetime]:
+        """Get the most recent trade timestamp for a symbol."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT timestamp FROM trade_audit
+                WHERE symbol = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (symbol,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            try:
+                return datetime.fromisoformat(row[0])
+            except Exception:
+                return None
+
+    def get_last_trade_time_for_underlying(self, underlying: str) -> Optional[datetime]:
+        """Get the most recent trade timestamp for an underlying symbol.
+
+        Uses a metadata string match for options trades.
+        """
+        pattern = f'"underlying": "{underlying}"'
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT timestamp FROM trade_audit
+                WHERE symbol = ? OR metadata LIKE ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (underlying, f"%{pattern}%"),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            try:
+                return datetime.fromisoformat(row[0])
+            except Exception:
+                return None
+
+    def get_x_since_id(self, username: str) -> Optional[str]:
+        """Get last seen X since_id for a username."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "SELECT since_id FROM x_state WHERE username = ?",
+                (username,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def set_x_since_id(self, username: str, since_id: str) -> None:
+        """Set last seen X since_id for a username."""
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO x_state(username, since_id, updated_at)
+                VALUES(?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(username) DO UPDATE SET
+                    since_id=excluded.since_id,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (username, since_id),
+            )

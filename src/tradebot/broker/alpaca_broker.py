@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Optional, List
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 from alpaca.trading.requests import TakeProfitRequest, StopLossRequest
 from alpaca.trading.requests import OrderRequest as AlpacaOrderRequest
 from alpaca.common.exceptions import APIError
@@ -253,6 +253,32 @@ class AlpacaBroker:
             return count
         except APIError as e:
             raise BrokerError(f"Cancel all error: {e}") from e
+
+    def list_open_orders(self, symbol: Optional[str] = None) -> list[dict]:
+        """List open orders, optionally filtered by symbol."""
+        try:
+            req = GetOrdersRequest(status=OrderStatus.OPEN)
+            if symbol:
+                req.symbols = [symbol]
+            orders = self.client.get_orders(filter=req)
+            results = []
+            for order in orders or []:
+                results.append(
+                    {
+                        "id": str(order.id),
+                        "symbol": order.symbol,
+                        "side": str(order.side),
+                        "qty": float(order.qty),
+                        "filled_qty": float(order.filled_qty) if order.filled_qty else 0,
+                        "status": str(order.status),
+                        "type": str(order.type),
+                        "created_at": str(order.created_at),
+                    }
+                )
+            return results
+        except Exception as e:
+            log.warning(f"Failed to list open orders: {e}")
+            return []
 
     def get_order(self, order_id: str) -> Optional[dict]:
         """Get order status.

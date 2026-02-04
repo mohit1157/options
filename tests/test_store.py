@@ -72,6 +72,30 @@ class TestSQLiteStore:
         )
         assert event_id2 is None
 
+    def test_add_duplicate_event_without_url(self, store: SQLiteStore):
+        """Test that duplicate events without URL are rejected via content hash."""
+        now = datetime.now(timezone.utc)
+
+        event_id1 = store.add_event(
+            type="news",
+            source="test",
+            created_at=now,
+            author="author",
+            url=None,
+            text="Same content",
+        )
+        assert event_id1 is not None
+
+        event_id2 = store.add_event(
+            type="news",
+            source="test",
+            created_at=now,
+            author="author",
+            url=None,
+            text="Same content",
+        )
+        assert event_id2 is None
+
     def test_event_exists(self, store: SQLiteStore):
         """Test event_exists method."""
         url = "https://example.com/exists"
@@ -145,6 +169,52 @@ class TestSQLiteStore:
         for score, label, source in results:
             assert isinstance(score, float)
             assert label in ("positive", "neutral", "negative")
+
+    def test_recent_sentiment_symbol_filter(self, store: SQLiteStore):
+        """Test recent sentiment filtered by symbol."""
+        now = datetime.now(timezone.utc)
+
+        event_id1 = store.add_event(
+            type="news",
+            source="test",
+            created_at=now,
+            author=None,
+            url="https://example.com/a",
+            text="SPY rallies on strong data",
+        )
+        store.add_sentiment(
+            event_id=event_id1,
+            score=0.5,
+            label="positive",
+            created_at=now,
+        )
+
+        event_id2 = store.add_event(
+            type="news",
+            source="test",
+            created_at=now,
+            author=None,
+            url="https://example.com/b",
+            text="AAPL reports earnings",
+        )
+        store.add_sentiment(
+            event_id=event_id2,
+            score=0.2,
+            label="positive",
+            created_at=now,
+        )
+
+        since = (now - timedelta(minutes=5)).isoformat()
+        results = store.recent_sentiment(since_iso=since, limit=10, symbol="SPY")
+
+        assert len(results) == 1
+        assert results[0][0] == 0.5
+
+    def test_x_state_roundtrip(self, store: SQLiteStore):
+        """Test storing and retrieving X since_id state."""
+        assert store.get_x_since_id("user1") is None
+        store.set_x_since_id("user1", "12345")
+        assert store.get_x_since_id("user1") == "12345"
 
     def test_cleanup_old_events(self, store: SQLiteStore):
         """Test cleaning up old events."""

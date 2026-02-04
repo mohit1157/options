@@ -8,7 +8,7 @@ from tradebot.config import Settings
 from tradebot.core.logger import get_logger
 from tradebot.core.timeutils import utcnow
 from tradebot.data.marketdata import fetch_bars, ema
-from tradebot.broker.alpaca_broker import AlpacaBroker
+from tradebot.broker.alpaca_broker import AlpacaBroker, InvalidOrderError, OrderRejectedError
 from tradebot.broker.models import OrderRequest
 from tradebot.risk.risk_manager import RiskManager
 from tradebot.data.store import SQLiteStore
@@ -63,10 +63,10 @@ class OptionsEmaSentimentStrategy:
             self._contracts_client = None
             log.debug("Options contracts client closed")
 
-    def _sentiment_gate(self) -> float:
-        """Get average sentiment from recent events."""
+    def _sentiment_gate(self, symbol: str) -> float:
+        """Get average sentiment from recent events for a symbol."""
         since = (utcnow() - timedelta(minutes=30)).isoformat()
-        rows = self.store.recent_sentiment(since_iso=since, limit=50)
+        rows = self.store.recent_sentiment(since_iso=since, limit=50, symbol=symbol)
         if not rows:
             return 0.0
         scores = [r[0] for r in rows]
@@ -80,6 +80,9 @@ class OptionsEmaSentimentStrategy:
         # Check if options trading is enabled
         if not self.settings.enable_options:
             return
+        if self.settings.market_open_only and not self.broker.is_market_open():
+            log.info("[OPTIONS] Market closed, skipping options strategy tick")
+            return
 
         try:
             acct = self.broker.account()
@@ -87,14 +90,16 @@ class OptionsEmaSentimentStrategy:
         except Exception as e:
             log.error(f"Failed to get account info: {e}")
             return
-
-        sentiment = self._sentiment_gate()
-        log.info(f"[OPTIONS] Recent sentiment avg: {sentiment:.3f}")
+        if self.risk.daily_loss_exceeded(current_equity_usd=equity):
+            log.warning("[OPTIONS] Max daily loss exceeded, skipping options tick")
+            return
 
         contracts_client = self._get_contracts_client()
 
         for underlying in self.settings.symbols_list:
             try:
+                sentiment = self._sentiment_gate(underlying)
+                log.info(f"[OPTIONS] {underlying} sentiment avg: {sentiment:.3f}")
                 self._process_symbol(
                     underlying=underlying,
                     equity=equity,
@@ -112,6 +117,16 @@ class OptionsEmaSentimentStrategy:
         contracts_client: AlpacaOptionsContractsClient,
     ) -> None:
         """Process a single underlying symbol for options signals."""
+        # Cooldown check (by underlying)
+        if self.settings.trade_cooldown_minutes > 0:
+            last_trade = self.store.get_last_trade_time_for_underlying(underlying)
+            if last_trade:
+                now = datetime.now(timezone.utc)
+                delta = now - last_trade.astimezone(timezone.utc)
+                if delta < timedelta(minutes=self.settings.trade_cooldown_minutes):
+                    log.info(f"[OPTIONS] {underlying}: cooldown active, skipping")
+                    return
+
         # Fetch price data
         bars = fetch_bars(
             self.settings.alpaca_api_key,
@@ -180,8 +195,46 @@ class OptionsEmaSentimentStrategy:
             )
             return
 
+        # Liquidity check (volume)
+        if contract.volume < self.settings.option_min_volume:
+            log.warning(
+                f"[OPTIONS] {contract.symbol} volume {contract.volume} below min "
+                f"{self.settings.option_min_volume}"
+            )
+            return
+
+        # Spread check and premium estimate
+        quote = contracts_client.get_latest_option_quote(contract.symbol)
+        if quote:
+            bid = quote.get("bid")
+            ask = quote.get("ask")
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+                spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+                if spread_pct > self.settings.option_max_spread_pct:
+                    log.warning(
+                        f"[OPTIONS] {contract.symbol} spread {spread_pct:.2%} "
+                        f"exceeds {self.settings.option_max_spread_pct:.2%}"
+                    )
+                    return
+        premium = contracts_client.get_latest_option_mid_price(contract.symbol)
+
         # Place the order
-        qty = self.settings.option_order_qty
+        if self.settings.option_use_dynamic_qty and premium:
+            qty = self.risk.calc_option_qty(equity_usd=equity, premium=premium)
+            if qty < 1:
+                log.info(f"[OPTIONS] {contract.symbol} dynamic qty=0, skipping")
+                return
+        else:
+            qty = self.settings.option_order_qty
+            if premium:
+                pos_value = qty * premium * 100
+                if not self.risk.position_value_ok(pos_value):
+                    log.warning(
+                        f"[OPTIONS] {contract.symbol} position value {pos_value:.2f} "
+                        f"exceeds max {self.risk.max_position_value_usd:.2f}"
+                    )
+                    return
 
         log.info(
             f"[OPTIONS] BUY {contract.symbol} "
@@ -191,9 +244,30 @@ class OptionsEmaSentimentStrategy:
         )
 
         try:
-            order_id = self.broker.place_order(
-                OrderRequest(symbol=contract.symbol, side="buy", qty=qty)
-            )
+            # Skip if position or open order exists for this contract
+            try:
+                pos = self.broker.get_position(contract.symbol)
+                if pos and abs(pos.qty) > 0:
+                    log.info(f"[OPTIONS] {contract.symbol}: existing position, skipping")
+                    return
+            except Exception as e:
+                log.warning(f"[OPTIONS] {contract.symbol}: position check failed: {e}")
+
+            open_orders = self.broker.list_open_orders(symbol=contract.symbol)
+            if open_orders:
+                log.info(f"[OPTIONS] {contract.symbol}: open orders exist, skipping")
+                return
+
+            req = OrderRequest(symbol=contract.symbol, side="buy", qty=qty)
+
+            # Optional bracket for options if premium known
+            if self.settings.option_use_bracket and premium:
+                sl = premium * (1.0 - self.settings.option_stop_loss_pct)
+                tp = premium * (1.0 + self.settings.option_take_profit_pct)
+                req.stop_loss_price = round(sl, 4)
+                req.take_profit_price = round(tp, 4)
+
+            order_id = self.broker.place_order(req)
 
             # Log to audit
             self.store.log_trade(
@@ -211,9 +285,40 @@ class OptionsEmaSentimentStrategy:
                     "contract_type": contract.type,
                     "signal": signal_type,
                     "sentiment": sentiment,
+                    "premium": premium,
                 },
             )
             log.info(f"[OPTIONS] Order submitted: {order_id}")
+
+        except (InvalidOrderError, OrderRejectedError) as e:
+            if self.settings.option_use_bracket:
+                log.warning(f"[OPTIONS] Bracket order failed, retrying market: {e}")
+                try:
+                    order_id = self.broker.place_order(
+                        OrderRequest(symbol=contract.symbol, side="buy", qty=qty)
+                    )
+                    self.store.log_trade(
+                        symbol=contract.symbol,
+                        side="buy",
+                        qty=qty,
+                        order_type="market",
+                        status="submitted",
+                        order_id=order_id,
+                        metadata={
+                            "underlying": underlying,
+                            "underlying_price": underlying_price,
+                            "strike": contract.strike_price,
+                            "expiration": contract.expiration_date,
+                            "contract_type": contract.type,
+                            "signal": signal_type,
+                            "sentiment": sentiment,
+                            "premium": premium,
+                        },
+                    )
+                    log.info(f"[OPTIONS] Market order submitted: {order_id}")
+                    return
+                except Exception as ex:
+                    log.error(f"[OPTIONS] Market fallback failed: {ex}")
 
         except Exception as e:
             log.error(f"[OPTIONS] Order failed for {contract.symbol}: {e}")

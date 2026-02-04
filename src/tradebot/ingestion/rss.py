@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import calendar
 import feedparser
-from typing import Iterable
 from datetime import datetime, timezone
 
 from tradebot.core.events import BaseEvent
+
+
+def _entry_time(entry) -> datetime:
+    """Extract a best-effort timestamp from an RSS entry."""
+    ts = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if ts:
+        try:
+            return datetime.fromtimestamp(calendar.timegm(ts), tz=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
 
 def fetch_rss_events(feeds: list[str]) -> list[BaseEvent]:
     events: list[BaseEvent] = []
@@ -19,7 +30,7 @@ def fetch_rss_events(feeds: list[str]) -> list[BaseEvent]:
                 BaseEvent(
                     type="news",
                     source=feed_url,
-                    created_at=datetime.now(timezone.utc),
+                    created_at=_entry_time(entry),
                     text=text,
                     url=link,
                     author=author,

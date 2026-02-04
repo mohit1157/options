@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     risk_per_trade_pct: float = 0.01
     stop_loss_pct: float = 0.005
     take_profit_pct: float = 0.01
+    trade_cooldown_minutes: int = 30
+    market_open_only: bool = True
 
     # RSS feeds (comma-separated URLs)
     rss_feeds: str = ""
@@ -57,6 +59,12 @@ class Settings(BaseSettings):
     option_order_qty: int = 1
     option_side_on_bull: str = "call"
     option_side_on_bear: str = "put"
+    option_use_dynamic_qty: bool = True
+    option_min_volume: int = 100
+    option_max_spread_pct: float = 0.15
+    option_use_bracket: bool = True
+    option_stop_loss_pct: float = 0.25
+    option_take_profit_pct: float = 0.5
 
     @field_validator("ema_fast", "ema_slow")
     @classmethod
@@ -113,6 +121,27 @@ class Settings(BaseSettings):
     def order_qty_positive(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"option_order_qty must be >= 1, got {v}")
+        return v
+
+    @field_validator("trade_cooldown_minutes")
+    @classmethod
+    def cooldown_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"trade_cooldown_minutes must be >= 0, got {v}")
+        return v
+
+    @field_validator("option_min_volume")
+    @classmethod
+    def option_min_volume_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"option_min_volume must be >= 0, got {v}")
+        return v
+
+    @field_validator("option_max_spread_pct", "option_stop_loss_pct", "option_take_profit_pct")
+    @classmethod
+    def option_pct_range(cls, v: float, info) -> float:
+        if v <= 0 or v > 1:
+            raise ValueError(f"{info.field_name} must be in (0, 1], got {v}")
         return v
 
     @field_validator("symbols")

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, date, timezone
+from math import floor
+from typing import Optional
 
 @dataclass
 class RiskManager:
@@ -9,6 +12,8 @@ class RiskManager:
     risk_per_trade_pct: float
     stop_loss_pct: float
     take_profit_pct: float
+    _daily_start_equity: Optional[float] = field(default=None, init=False, repr=False)
+    _daily_start_date: Optional[date] = field(default=None, init=False, repr=False)
 
     def position_value_ok(self, proposed_value_usd: float) -> bool:
         return proposed_value_usd <= self.max_position_value_usd
@@ -35,3 +40,49 @@ class RiskManager:
             sl = entry_price * (1.0 + self.stop_loss_pct)
             tp = entry_price * (1.0 - self.take_profit_pct)
         return (round(sl, 4), round(tp, 4))
+
+    def calc_option_qty(
+        self,
+        equity_usd: float,
+        premium: float,
+        contract_multiplier: int = 100,
+    ) -> int:
+        """Calculate options contract quantity based on risk and premium.
+
+        Uses risk_per_trade_pct and max_position_value_usd to cap exposure.
+        """
+        if premium <= 0 or contract_multiplier <= 0:
+            return 0
+
+        risk_budget = equity_usd * self.risk_per_trade_pct
+        cost_per_contract = premium * contract_multiplier
+
+        if cost_per_contract <= 0:
+            return 0
+
+        max_qty_by_risk = risk_budget / cost_per_contract
+        max_qty_by_value = self.max_position_value_usd / cost_per_contract
+
+        qty = min(max_qty_by_risk, max_qty_by_value)
+        return max(0, int(floor(qty)))
+
+    def daily_loss_exceeded(
+        self,
+        current_equity_usd: float,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Check if max daily loss has been exceeded.
+
+        Tracks the starting equity for each UTC day and compares against current equity.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+
+        today = now.date()
+        if self._daily_start_date != today or self._daily_start_equity is None:
+            self._daily_start_date = today
+            self._daily_start_equity = current_equity_usd
+            return False
+
+        loss = self._daily_start_equity - current_equity_usd
+        return loss >= self.max_daily_loss_usd

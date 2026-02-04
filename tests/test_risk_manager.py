@@ -1,4 +1,5 @@
 """Tests for RiskManager."""
+from datetime import datetime, timezone
 import pytest
 from tradebot.risk.risk_manager import RiskManager
 
@@ -45,6 +46,17 @@ class TestRiskManager:
         qty = risk_manager.calc_qty(equity_usd=1000000.0, price=50.0)
         assert qty <= 40.0
 
+    def test_calc_option_qty(self, risk_manager: RiskManager):
+        """Test option contract sizing."""
+        equity = 100000.0
+        premium = 2.0  # $2 per share, $200 per contract
+
+        qty = risk_manager.calc_option_qty(equity_usd=equity, premium=premium)
+        assert qty >= 0
+
+        # Max position value = 2000 => max 10 contracts at $200 each
+        assert qty <= 10
+
     def test_bracket_prices_buy(self, risk_manager: RiskManager):
         """Test bracket prices for buy orders."""
         entry = 100.0
@@ -81,6 +93,16 @@ class TestRiskManager:
         # Should be rounded to 4 decimal places
         assert sl == round(sl, 4)
         assert tp == round(tp, 4)
+
+    def test_daily_loss_exceeded(self, risk_manager: RiskManager):
+        """Test daily loss tracking."""
+        now = datetime.now(timezone.utc)
+        # Initialize day with equity
+        assert risk_manager.daily_loss_exceeded(10000.0, now=now) is False
+        # Loss below threshold
+        assert risk_manager.daily_loss_exceeded(9900.0, now=now) is False
+        # Loss exceeds threshold (default 250)
+        assert risk_manager.daily_loss_exceeded(9700.0, now=now) is True
 
 
 class TestRiskManagerEdgeCases:

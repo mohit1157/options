@@ -222,6 +222,7 @@ class XClient:
         self,
         username: str,
         max_results: int = 10,
+        since_id: Optional[str] = None,
     ) -> list[BaseEvent]:
         """Fetch recent tweets for a username and return as BaseEvents.
 
@@ -244,7 +245,11 @@ class XClient:
 
         # Fetch tweets
         try:
-            tweets = self.fetch_user_tweets(user_id, max_results=max_results)
+            tweets = self.fetch_user_tweets(
+                user_id,
+                max_results=max_results,
+                since_id=since_id,
+            )
         except XRateLimitError:
             log.warning(f"Rate limited when fetching tweets for @{username}")
             return []

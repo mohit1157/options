@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 from tradebot.config import Settings
 from tradebot.core.logger import get_logger
@@ -38,10 +38,10 @@ class EmaSentimentStrategy:
     risk: RiskManager
     store: SQLiteStore
 
-    def _sentiment_gate(self) -> float:
-        """Aggregate recent sentiment (last 30 minutes) from stored events."""
+    def _sentiment_gate(self, symbol: str) -> float:
+        """Aggregate recent sentiment (last 30 minutes) for a symbol."""
         since = (utcnow() - timedelta(minutes=30)).isoformat()
-        rows = self.store.recent_sentiment(since_iso=since, limit=50)
+        rows = self.store.recent_sentiment(since_iso=since, limit=50, symbol=symbol)
         if not rows:
             return 0.0
         scores = [r[0] for r in rows]
@@ -52,6 +52,10 @@ class EmaSentimentStrategy:
 
         Called periodically from the main loop.
         """
+        if self.settings.market_open_only and not self.broker.is_market_open():
+            log.info("Market closed, skipping strategy tick")
+            return
+
         try:
             acct = self.broker.account()
             equity = float(acct.equity)
@@ -59,11 +63,14 @@ class EmaSentimentStrategy:
             log.error(f"Failed to get account info: {e}")
             return
 
-        sentiment = self._sentiment_gate()
-        log.info(f"Recent sentiment avg: {sentiment:.3f}")
+        if self.risk.daily_loss_exceeded(current_equity_usd=equity):
+            log.warning("Max daily loss exceeded, skipping strategy tick")
+            return
 
         for symbol in self.settings.symbols_list:
             try:
+                sentiment = self._sentiment_gate(symbol)
+                log.info(f"{symbol} sentiment avg: {sentiment:.3f}")
                 self._process_symbol(
                     symbol=symbol,
                     equity=equity,
@@ -79,6 +86,31 @@ class EmaSentimentStrategy:
         sentiment: float,
     ) -> None:
         """Process a single symbol for trading signals."""
+        # Cooldown check
+        if self.settings.trade_cooldown_minutes > 0:
+            last_trade = self.store.get_last_trade_time(symbol)
+            if last_trade:
+                now = datetime.now(timezone.utc)
+                delta = now - last_trade.astimezone(timezone.utc)
+                if delta < timedelta(minutes=self.settings.trade_cooldown_minutes):
+                    log.info(f"{symbol}: cooldown active, skipping")
+                    return
+
+        # Skip if already in a position
+        try:
+            pos = self.broker.get_position(symbol)
+            if pos and abs(pos.qty) > 0:
+                log.info(f"{symbol}: existing position detected, skipping")
+                return
+        except Exception as e:
+            log.warning(f"{symbol}: position check failed: {e}")
+
+        # Skip if open orders exist
+        open_orders = self.broker.list_open_orders(symbol=symbol)
+        if open_orders:
+            log.info(f"{symbol}: open orders exist, skipping")
+            return
+
         bars = fetch_bars(
             self.settings.alpaca_api_key,
             self.settings.alpaca_api_secret,
@@ -130,6 +162,9 @@ class EmaSentimentStrategy:
         qty = self.risk.calc_qty(equity_usd=equity, price=price)
         if qty <= 0:
             log.debug(f"Buy signal for {symbol} but qty=0")
+            return
+        if not self.risk.position_value_ok(qty * price):
+            log.warning(f"Buy signal for {symbol} exceeds max position value")
             return
 
         sl, tp = self.risk.bracket_prices(entry_price=price, side="buy")
@@ -188,6 +223,9 @@ class EmaSentimentStrategy:
         qty = self.risk.calc_qty(equity_usd=equity, price=price)
         if qty <= 0:
             log.debug(f"Sell signal for {symbol} but qty=0")
+            return
+        if not self.risk.position_value_ok(qty * price):
+            log.warning(f"Sell signal for {symbol} exceeds max position value")
             return
 
         sl, tp = self.risk.bracket_prices(entry_price=price, side="sell")
