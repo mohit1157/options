@@ -17,7 +17,7 @@ A modular, **event-driven** Python project scaffold that:
 The code includes:
 - A working RSS ingestor
 - A working Alpaca broker adapter (paper trading by default)
-- A simple example strategy (EMA crossover + sentiment gate)
+- A 3‑minute EMA pop‑pullback‑hold options strategy (calls + puts)
 - A clean interface to plug in Grok sentiment & X ingestion once you add credentials
 
 ## Folder structure
@@ -45,7 +45,8 @@ autonomous_trading_bot/
       store.py                # SQLite store
     strategy/
       base.py
-      ema_sentiment.py        # Example strategy
+      ema_sentiment.py        # Legacy example strategy
+      pop_pullback_hold.py    # 3‑min EMA pop‑pullback‑hold options strategy
     risk/
       risk_manager.py         # Position sizing, limits, SL/TP helpers
   scripts/
@@ -90,8 +91,9 @@ python -m tradebot.app run --paper
    - Default provided: `LocalRuleSentiment` (simple keyword scoring).
    - Plug-in provided: `GrokSentimentClient` (HTTP skeleton).
 3. **Strategy**
-   - The example strategy fetches bars from Alpaca, computes EMA fast/slow, and trades on crossover *only if*
-     recent sentiment for the watched entities is above a threshold.
+   - The active strategy runs on **3‑minute candles** of the **underlying** and computes EMA9.
+   - It trades continuation after a pop above/below EMA, a pullback to EMA, and a 1–2 candle hold.
+   - Entry triggers on a break of the confirmation candle’s high/low, with partial profits and EMA exits.
 4. **Risk**
    - Central `RiskManager` enforces max daily loss, max position size, and sets SL/TP brackets.
 5. **Execution**
@@ -123,7 +125,22 @@ and all legal/regulatory requirements.
 This version is set up for **US stocks/ETFs + US equity/ETF options** via Alpaca. Alpaca supports options trading in paper by default and offers options trading levels for live accounts. (See Alpaca Options Trading docs.)
 
 ### Options flow in this repo
-1) Detect an underlying signal (example: EMA crossover on SPY/QQQ)
+1) Detect an underlying signal (3‑min EMA pop → pullback → hold confirmation)
 2) Select an option contract (nearest expiry within your DTE window + ATM-ish strike)
-3) Place a single-leg options order via Alpaca Trading API
+3) Place a single‑leg options order via Alpaca Trading API
 
+## Strategy Configuration (Pop‑Pullback‑Hold)
+These are configurable via env vars (see `src/tradebot/config.py`).
+
+- `POP_PULLBACK_EMA_LENGTH` (default `9`)
+- `POP_PULLBACK_HOLD_CANDLES_REQUIRED` (default `2`, allowed `1` or `2`)
+- `POP_PULLBACK_STRENGTH_FILTER` (default `false`)
+- `POP_PULLBACK_STOP_BUFFER` (default `0.0`)
+- `POP_PULLBACK_STOP_BUFFER_MODE` (`price` or `percent`)
+- `POP_PULLBACK_TARGET_PROFIT_PCT` (default `0.07`, allowed `0.06`–`0.08`)
+- `POP_PULLBACK_ENTRY_TIMEOUT_CANDLES` (default `3`)
+- `POP_PULLBACK_EMA_EXIT_MODE` (`close` or `intrabar`)
+- `POP_PULLBACK_PROFIT_CALC_ON_UNDERLYING` (default `true`)
+
+Additional options selection knobs:
+- `OPTION_DTE_MAX`, `OPTION_STRIKE_TOLERANCE`, `OPTION_ORDER_QTY`, `OPTION_USE_DYNAMIC_QTY`
