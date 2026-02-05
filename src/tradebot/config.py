@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     pop_pullback_entry_timeout_candles: int = 3
     pop_pullback_ema_exit_mode: str = "close"  # "close" or "intrabar"
     pop_pullback_profit_calc_on_underlying: bool = True
+    pop_pullback_zone_lookback_bars: int = 20
 
     # Risk parameters
     max_daily_loss_usd: float = 250.0
@@ -71,6 +72,7 @@ class Settings(BaseSettings):
     option_side_on_bull: str = "call"
     option_side_on_bear: str = "put"
     option_use_dynamic_qty: bool = True
+    option_portfolio_pct: float = 0.2
     option_min_volume: int = 100
     option_max_spread_pct: float = 0.15
     option_use_bracket: bool = True
@@ -148,7 +150,12 @@ class Settings(BaseSettings):
             raise ValueError(f"option_min_volume must be >= 0, got {v}")
         return v
 
-    @field_validator("option_max_spread_pct", "option_stop_loss_pct", "option_take_profit_pct")
+    @field_validator(
+        "option_max_spread_pct",
+        "option_stop_loss_pct",
+        "option_take_profit_pct",
+        "option_portfolio_pct",
+    )
     @classmethod
     def option_pct_range(cls, v: float, info) -> float:
         if v <= 0 or v > 1:
@@ -196,6 +203,13 @@ class Settings(BaseSettings):
     def pop_pullback_entry_timeout_positive(cls, v: int) -> int:
         if v < 1:
             raise ValueError("pop_pullback_entry_timeout_candles must be >= 1")
+        return v
+
+    @field_validator("pop_pullback_zone_lookback_bars")
+    @classmethod
+    def pop_pullback_zone_lookback_positive(cls, v: int) -> int:
+        if v < 2:
+            raise ValueError("pop_pullback_zone_lookback_bars must be >= 2")
         return v
 
     @field_validator("pop_pullback_ema_exit_mode")

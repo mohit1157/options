@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Dict, List
+import re
+from typing import Optional, Dict, List, Tuple
 
 from tradebot.config import Settings
 from tradebot.core.logger import get_logger
@@ -60,7 +61,8 @@ class EmaPopPullbackHoldOptionsStrategy:
     )
     _state: Dict[str, SetupState] = field(default_factory=dict, init=False)
     _last_bar_time: Dict[str, datetime] = field(default_factory=dict, init=False)
-    _active_trade: Optional[TradeState] = field(default=None, init=False)
+    _active_trades: Dict[str, TradeState] = field(default_factory=dict, init=False)
+    _recovered_symbols: set[str] = field(default_factory=set, init=False)
 
     def _get_contracts_client(self) -> AlpacaOptionsContractsClient:
         if self._contracts_client is None:
@@ -89,6 +91,97 @@ class EmaPopPullbackHoldOptionsStrategy:
             return base_price * self.settings.pop_pullback_stop_buffer
         return self.settings.pop_pullback_stop_buffer
 
+    def _parse_option_symbol(self, symbol: str) -> Optional[Tuple[str, str]]:
+        """Parse OCC option symbol to extract underlying + type.
+
+        Returns:
+            (underlying, direction) where direction is "call" or "put"
+        """
+        # Example: QQQ260206P00600000
+        m = re.match(r"^([A-Za-z]{1,6})\d{6}([CP])\d{8}$", symbol)
+        if not m:
+            return None
+        underlying = m.group(1).upper()
+        opt_type = m.group(2)
+        direction = "call" if opt_type == "C" else "put"
+        return (underlying, direction)
+
+    def _recover_active_trades(self) -> None:
+        """Recover open options trades after restart, if any."""
+        if self._active_trades:
+            return
+
+        try:
+            positions = self.broker.list_positions()
+        except Exception as e:
+            log.debug(f"Recovery: failed to fetch positions: {e}")
+            return
+
+        option_positions = []
+        for p in positions:
+            parsed = self._parse_option_symbol(p.symbol)
+            if parsed and abs(p.qty) > 0:
+                option_positions.append((p, parsed))
+
+        if not option_positions:
+            return
+
+        # Recover all option positions
+        for pos, (underlying, direction) in option_positions:
+            qty = int(abs(pos.qty))
+            entry_option = float(pos.avg_entry_price) if pos.avg_entry_price else None
+
+            # Use latest close as a placeholder for entry_underlying (not used for premium-based exits)
+            entry_underlying = 0.0
+            try:
+                bars = fetch_bars(
+                    self.settings.alpaca_api_key,
+                    self.settings.alpaca_api_secret,
+                    symbol=underlying,
+                    timeframe="3Min",
+                    limit=1,
+                    feed=self.settings.alpaca_data_feed,
+                )
+                if not bars.empty:
+                    entry_underlying = float(bars["close"].iloc[-1])
+            except Exception:
+                pass
+
+            # Try to recover original qty from audit log (if larger than current)
+            original_qty = qty
+            try:
+                history = self.store.get_trade_history(symbol=pos.symbol, limit=20)
+                for rec in history:
+                    if rec.get("side") == "buy":
+                        try:
+                            original_qty = int(float(rec.get("qty") or qty))
+                        except Exception:
+                            original_qty = qty
+                        break
+            except Exception:
+                original_qty = qty
+
+            trimmed = qty < original_qty
+
+            self._active_trades[pos.symbol] = TradeState(
+                underlying=underlying,
+                option_symbol=pos.symbol,
+                direction=direction,
+                entry_underlying=entry_underlying,
+                entry_option=entry_option,
+                stop_price=0.0,
+                original_qty=original_qty,
+                remaining_qty=qty,
+                trimmed=trimmed,
+            )
+
+            if pos.symbol not in self._recovered_symbols:
+                self._recovered_symbols.add(pos.symbol)
+                log.info(
+                    f"Recovered open options position: {pos.symbol} "
+                    f"qty={qty} dir={direction} entry_px={entry_option}"
+                )
+
     def tick(self) -> None:
         if not self.settings.enable_options:
             return
@@ -104,14 +197,13 @@ class EmaPopPullbackHoldOptionsStrategy:
             log.error(f"Failed to get account info: {e}")
             return
 
-        max_loss_hit = self.risk.daily_loss_exceeded(current_equity_usd=equity)
-        if max_loss_hit and self._active_trade is None:
-            log.warning("Max daily loss exceeded, skipping new entries")
-            return
+        # Recover an open trade if bot restarted and an options position exists
+        if not self._active_trades:
+            self._recover_active_trades()
 
-        # Only one trade active at a time
-        if self._active_trade:
-            self._process_symbol(self._active_trade.underlying, equity)
+        max_loss_hit = self.risk.daily_loss_exceeded(current_equity_usd=equity)
+        if max_loss_hit and not self._active_trades:
+            log.warning("Max daily loss exceeded, skipping new entries")
             return
 
         for symbol in self.settings.symbols_list:
@@ -177,18 +269,32 @@ class EmaPopPullbackHoldOptionsStrategy:
         close_now = float(closes.iloc[i])
         high_now = float(highs.iloc[i])
         low_now = float(lows.iloc[i])
+        lookback = self.settings.pop_pullback_zone_lookback_bars
+        end = i  # exclude current bar from zone calculation
+        start = max(0, end - lookback)
+        if end <= start:
+            zone_low = None
+            zone_high = None
+        else:
+            zone_low = float(lows.iloc[start:end].min())
+            zone_high = float(highs.iloc[start:end].max())
 
-        # Manage active trade first
-        if self._active_trade and self._active_trade.underlying == symbol:
-            self._manage_trade(
-                trade=self._active_trade,
-                ema_now=ema_now,
-                close_now=close_now,
-                high_now=high_now,
-                low_now=low_now,
-            )
-            # Trade may have been closed
-            if self._active_trade is None:
+        # Manage active trades for this underlying first
+        active_for_symbol = [
+            t for t in self._active_trades.values() if t.underlying == symbol
+        ]
+        if active_for_symbol:
+            for trade in list(active_for_symbol):
+                self._manage_trade(
+                    trade=trade,
+                    ema_now=ema_now,
+                    close_now=close_now,
+                    high_now=high_now,
+                    low_now=low_now,
+                    zone_low=zone_low,
+                    zone_high=zone_high,
+                )
+            if not any(t.underlying == symbol for t in self._active_trades.values()):
                 self._reset_state(symbol)
             return
 
@@ -343,7 +449,7 @@ class EmaPopPullbackHoldOptionsStrategy:
         base_high: Optional[float],
         equity: float,
     ) -> None:
-        if self._active_trade is not None:
+        if self._active_trades:
             return
 
         # Guard against existing open positions/orders
@@ -382,7 +488,11 @@ class EmaPopPullbackHoldOptionsStrategy:
         premium = contracts_client.get_latest_option_mid_price(contract.symbol)
 
         if self.settings.option_use_dynamic_qty and premium:
-            qty = self.risk.calc_option_qty(equity_usd=equity, premium=premium)
+            qty = self.risk.calc_option_qty(
+                equity_usd=equity,
+                premium=premium,
+                portfolio_pct=self.settings.option_portfolio_pct,
+            )
         else:
             qty = self.settings.option_order_qty
 
@@ -425,7 +535,7 @@ class EmaPopPullbackHoldOptionsStrategy:
             },
         )
 
-        self._active_trade = TradeState(
+        self._active_trades[contract.symbol] = TradeState(
             underlying=symbol,
             option_symbol=contract.symbol,
             direction=direction,
@@ -450,16 +560,76 @@ class EmaPopPullbackHoldOptionsStrategy:
         close_now: float,
         high_now: float,
         low_now: float,
+        zone_low: Optional[float],
+        zone_high: Optional[float],
     ) -> None:
-        # Stop loss checks (underlying-based)
-        if trade.direction == "call":
-            if close_now <= trade.stop_price or low_now <= trade.stop_price:
-                self._exit_full(trade, reason="stop")
-                return
+        # Snapshot PnL + portfolio status for logging
+        option_price = self._get_option_price(trade.option_symbol)
+        entry_option = trade.entry_option
+        target_pct = self.settings.pop_pullback_target_profit_pct
+        entry_value = None
+        current_value = None
+        profit = None
+        profit_pct = None
+        target_profit = None
+        if option_price is not None and entry_option:
+            entry_value = entry_option * 100 * trade.original_qty
+            current_value = option_price * 100 * trade.original_qty
+            profit = current_value - entry_value
+            if entry_value > 0:
+                profit_pct = (profit / entry_value) * 100
+            target_profit = entry_value * target_pct
+
+        active_trades = None
+        total_unrealized = None
+        try:
+            positions = self.broker.list_positions()
+            active_trades = len(positions)
+            total_unrealized = sum(p.unrealized_pl for p in positions)
+        except Exception as e:
+            log.debug(f"Status log: failed to fetch positions: {e}")
+
+        parts = [
+            f"Trade status {trade.option_symbol}",
+            f"dir={trade.direction}",
+            f"qty={trade.remaining_qty}/{trade.original_qty}",
+        ]
+        if option_price is not None and entry_option:
+            parts.append(f"opt_px={option_price:.2f} entry_px={entry_option:.2f}")
+            if profit is not None and profit_pct is not None:
+                parts.append(f"pnl=${profit:.2f} ({profit_pct:.2f}%)")
+            if target_profit is not None:
+                parts.append(f"target=${target_profit:.2f}")
         else:
-            if close_now >= trade.stop_price or high_now >= trade.stop_price:
-                self._exit_full(trade, reason="stop")
-                return
+            parts.append("opt_px=NA")
+
+        if zone_low is not None and zone_high is not None:
+            parts.append(f"zone_low={zone_low:.2f} zone_high={zone_high:.2f}")
+        if active_trades is not None:
+            parts.append(f"active_trades={active_trades}")
+        if total_unrealized is not None:
+            parts.append(f"total_unrealized=${total_unrealized:.2f}")
+
+        log.info(" | ".join(parts))
+
+        # Zone-based exits (support/resistance)
+        zone_stop = False
+        zone_target = False
+        if zone_low is not None and zone_high is not None:
+            if trade.direction == "call":
+                if low_now <= zone_low or close_now <= zone_low:
+                    zone_stop = True
+                if high_now >= zone_high or close_now >= zone_high:
+                    zone_target = True
+            else:
+                if high_now >= zone_high or close_now >= zone_high:
+                    zone_stop = True
+                if low_now <= zone_low or close_now <= zone_low:
+                    zone_target = True
+
+        if zone_stop:
+            self._exit_full(trade, reason="zone_stop")
+            return
 
         # Partial profit target
         if not trade.trimmed:
@@ -468,32 +638,41 @@ class EmaPopPullbackHoldOptionsStrategy:
                 current_price = close_now
                 entry_price = trade.entry_underlying
             else:
-                current_price = self._get_option_price(trade.option_symbol)
+                current_price = option_price
                 entry_price = trade.entry_option
 
+            hit = zone_target
             if current_price is not None and entry_price:
-                target_pct = self.settings.pop_pullback_target_profit_pct
-                if trade.direction == "call":
-                    hit = current_price >= entry_price * (1 + target_pct)
-                else:
-                    if profit_on_underlying:
-                        hit = current_price <= entry_price * (1 - target_pct)
+                if profit_on_underlying:
+                    if trade.direction == "call":
+                        hit = hit or (current_price >= entry_price * (1 + target_pct))
                     else:
-                        # Option price profits when price increases for long puts
-                        hit = current_price >= entry_price * (1 + target_pct)
+                        hit = hit or (current_price <= entry_price * (1 - target_pct))
+                else:
+                    # Use total trade profit in dollars (based on option premium)
+                    entry_value = entry_price * 100 * trade.original_qty
+                    current_value = current_price * 100 * trade.original_qty
+                    profit = current_value - entry_value
+                    target_profit = entry_value * target_pct
+                    hit = hit or (profit >= target_profit)
 
-                if hit:
-                    trim_qty = int(trade.original_qty * 0.8)
-                    if trim_qty < 1:
-                        self._exit_full(trade, reason="target")
-                        return
-                    if trim_qty >= trade.remaining_qty:
-                        self._exit_full(trade, reason="target")
-                        return
+            if hit:
+                trim_qty = int(trade.original_qty * 0.9)
+                if trim_qty < 1:
+                    self._exit_full(trade, reason="target")
+                    return
+                if trim_qty >= trade.remaining_qty:
+                    self._exit_full(trade, reason="target")
+                    return
 
-                    if self._exit_partial(trade, trim_qty, reason="target"):
-                        trade.remaining_qty -= trim_qty
-                        trade.trimmed = True
+                if self._exit_partial(trade, trim_qty, reason="target"):
+                    trade.remaining_qty -= trim_qty
+                    trade.trimmed = True
+
+        # If already trimmed, zone target should exit the remainder
+        if trade.trimmed and zone_target:
+            self._exit_full(trade, reason="zone_target")
+            return
 
         # EMA exit for remaining position
         if trade.remaining_qty <= 0:
@@ -549,7 +728,7 @@ class EmaPopPullbackHoldOptionsStrategy:
     def _exit_full(self, trade: TradeState, reason: str) -> None:
         qty = trade.remaining_qty
         if qty <= 0:
-            self._active_trade = None
+            self._active_trades.pop(trade.option_symbol, None)
             return
 
         try:
@@ -574,4 +753,4 @@ class EmaPopPullbackHoldOptionsStrategy:
         except Exception as e:
             log.error(f"Full exit failed for {trade.option_symbol}: {e}")
         finally:
-            self._active_trade = None
+            self._active_trades.pop(trade.option_symbol, None)

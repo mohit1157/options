@@ -45,25 +45,35 @@ class RiskManager:
         self,
         equity_usd: float,
         premium: float,
+        *,
+        portfolio_pct: Optional[float] = None,
         contract_multiplier: int = 100,
     ) -> int:
         """Calculate options contract quantity based on risk and premium.
 
-        Uses risk_per_trade_pct and max_position_value_usd to cap exposure.
+        If portfolio_pct is provided, size by that portion of equity.
+        Otherwise uses risk_per_trade_pct and max_position_value_usd to cap exposure.
         """
         if premium <= 0 or contract_multiplier <= 0:
             return 0
 
-        risk_budget = equity_usd * self.risk_per_trade_pct
+        if portfolio_pct is not None:
+            if portfolio_pct <= 0 or portfolio_pct > 1:
+                return 0
+            risk_budget = equity_usd * portfolio_pct
+        else:
+            risk_budget = equity_usd * self.risk_per_trade_pct
         cost_per_contract = premium * contract_multiplier
 
         if cost_per_contract <= 0:
             return 0
 
         max_qty_by_risk = risk_budget / cost_per_contract
-        max_qty_by_value = self.max_position_value_usd / cost_per_contract
-
-        qty = min(max_qty_by_risk, max_qty_by_value)
+        if portfolio_pct is not None:
+            qty = max_qty_by_risk
+        else:
+            max_qty_by_value = self.max_position_value_usd / cost_per_contract
+            qty = min(max_qty_by_risk, max_qty_by_value)
         return max(0, int(floor(qty)))
 
     def daily_loss_exceeded(
