@@ -39,7 +39,19 @@ def _tf(tf: str) -> TimeFrame:
     return TimeFrame.Minute
 
 
-@with_retry(max_attempts=3, min_wait=1.0, max_wait=10.0)
+# Cache for client instances to reuse connections
+_client_cache: dict[tuple[str, str], StockHistoricalDataClient] = {}
+
+
+def _get_client(api_key: str, api_secret: str) -> StockHistoricalDataClient:
+    """Get or create a cached client instance."""
+    key = (api_key, api_secret)
+    if key not in _client_cache:
+        _client_cache[key] = StockHistoricalDataClient(api_key, api_secret)
+    return _client_cache[key]
+
+
+@with_retry(max_attempts=5, min_wait=2.0, max_wait=15.0)
 def fetch_bars(
     api_key: str,
     api_secret: str,
@@ -68,7 +80,7 @@ def fetch_bars(
             print(f"Latest close: {bars['close'].iloc[-1]}")
     """
     try:
-        client = StockHistoricalDataClient(api_key, api_secret)
+        client = _get_client(api_key, api_secret)
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=_tf(timeframe),

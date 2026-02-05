@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import ssl
 from functools import wraps
 from typing import Any, Callable, TypeVar
 
@@ -13,6 +14,8 @@ from tenacity import (
     RetryError,
 )
 import httpx
+from urllib3.exceptions import SSLError as Urllib3SSLError
+from requests.exceptions import SSLError as RequestsSSLError
 
 from tradebot.core.logger import get_logger
 
@@ -28,7 +31,12 @@ RETRYABLE_EXCEPTIONS = (
     httpx.WriteTimeout,
     httpx.PoolTimeout,
     ConnectionError,
+    ConnectionResetError,
     TimeoutError,
+    ssl.SSLError,
+    Urllib3SSLError,
+    RequestsSSLError,
+    OSError,  # Catches various network-related OS errors
 )
 
 
