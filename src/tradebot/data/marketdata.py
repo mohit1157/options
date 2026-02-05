@@ -6,7 +6,7 @@ from typing import Optional
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from tradebot.core.logger import get_logger
 from tradebot.core.retry import with_retry
@@ -25,13 +25,13 @@ def _tf(tf: str) -> TimeFrame:
     if t in ("1min", "1m", "1"):
         return TimeFrame.Minute
     if t in ("3min", "3m", "3"):
-        return TimeFrame(3, TimeFrame.Unit.Minute)
+        return TimeFrame(3, TimeFrameUnit.Minute)
     if t in ("5min", "5m", "5"):
-        return TimeFrame(5, TimeFrame.Unit.Minute)
+        return TimeFrame(5, TimeFrameUnit.Minute)
     if t in ("15min", "15m", "15"):
-        return TimeFrame(15, TimeFrame.Unit.Minute)
+        return TimeFrame(15, TimeFrameUnit.Minute)
     if t in ("30min", "30m", "30"):
-        return TimeFrame(30, TimeFrame.Unit.Minute)
+        return TimeFrame(30, TimeFrameUnit.Minute)
     if t in ("1hour", "1h", "60min", "60m"):
         return TimeFrame.Hour
     if t in ("1day", "1d", "d", "day"):

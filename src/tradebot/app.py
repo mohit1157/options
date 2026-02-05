@@ -20,6 +20,7 @@ from tradebot.data.store import SQLiteStore
 from tradebot.broker.alpaca_broker import AlpacaBroker
 from tradebot.risk.risk_manager import RiskManager
 from tradebot.strategy.pop_pullback_hold import EmaPopPullbackHoldOptionsStrategy
+from tradebot.strategy.ema_sentiment import EmaSentimentStrategy
 
 log = get_logger("tradebot")
 cli_app = typer.Typer(help="Autonomous trading bot (Alpaca + X/RSS + sentiment).")
@@ -166,7 +167,15 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
         take_profit_pct=settings.take_profit_pct,
     )
 
-    # Initialize strategy
+    # Initialize stock strategy
+    stock_strategy = EmaSentimentStrategy(
+        settings=settings,
+        broker=broker,
+        risk=risk,
+        store=store,
+    )
+
+    # Initialize options strategy
     opt_strategy = EmaPopPullbackHoldOptionsStrategy(
         settings=settings,
         broker=broker,
@@ -298,7 +307,16 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
                 except Exception as ex:
                     log.warning(f"X ingestion error: {ex}")
 
-            # 3) Options strategy tick (if enabled)
+            # 3) Stock strategy tick
+            if not settings.market_open_only or broker.is_market_open():
+                try:
+                    alpaca_breaker.call(lambda: stock_strategy.tick())
+                except CircuitOpenError:
+                    log.warning("Alpaca circuit open, skipping stock strategy tick")
+                except Exception as ex:
+                    log.exception(f"Stock strategy tick error: {ex}")
+
+            # 4) Options strategy tick (if enabled)
             if settings.enable_options:
                 try:
                     alpaca_breaker.call(lambda: opt_strategy.tick())

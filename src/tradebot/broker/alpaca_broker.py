@@ -5,7 +5,7 @@ from typing import Optional, List
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, QueryOrderStatus
 from alpaca.trading.requests import TakeProfitRequest, StopLossRequest
 from alpaca.trading.requests import OrderRequest as AlpacaOrderRequest
 from alpaca.common.exceptions import APIError
@@ -257,7 +257,7 @@ class AlpacaBroker:
     def list_open_orders(self, symbol: Optional[str] = None) -> list[dict]:
         """List open orders, optionally filtered by symbol."""
         try:
-            req = GetOrdersRequest(status=OrderStatus.OPEN)
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
             if symbol:
                 req.symbols = [symbol]
             orders = self.client.get_orders(filter=req)
