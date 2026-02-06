@@ -91,6 +91,32 @@ class EmaPopPullbackHoldOptionsStrategy:
             return base_price * self.settings.pop_pullback_stop_buffer
         return self.settings.pop_pullback_stop_buffer
 
+    def _profit_target_hit(
+        self,
+        *,
+        direction: str,
+        current_price: Optional[float],
+        entry_price: Optional[float],
+        target_pct: float,
+        qty: int,
+        profit_on_underlying: bool,
+    ) -> bool:
+        if current_price is None or entry_price is None or qty < 1:
+            return False
+
+        if profit_on_underlying:
+            if direction == "call":
+                return current_price >= entry_price * (1 + target_pct)
+            return current_price <= entry_price * (1 - target_pct)
+
+        entry_value = entry_price * 100 * qty
+        if entry_value <= 0:
+            return False
+        current_value = current_price * 100 * qty
+        profit = current_value - entry_value
+        target_profit = entry_value * target_pct
+        return profit >= target_profit
+
     def _parse_option_symbol(self, symbol: str) -> Optional[Tuple[str, str]]:
         """Parse OCC option symbol to extract underlying + type.
 
@@ -149,6 +175,7 @@ class EmaPopPullbackHoldOptionsStrategy:
 
             # Try to recover original qty from audit log (if larger than current)
             original_qty = qty
+            recovered_stop_price = 0.0
             try:
                 history = self.store.get_trade_history(symbol=pos.symbol, limit=20)
                 for rec in history:
@@ -157,6 +184,11 @@ class EmaPopPullbackHoldOptionsStrategy:
                             original_qty = int(float(rec.get("qty") or qty))
                         except Exception:
                             original_qty = qty
+                        metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+                        try:
+                            recovered_stop_price = float(metadata.get("stop_price", 0.0))
+                        except Exception:
+                            recovered_stop_price = 0.0
                         break
             except Exception:
                 original_qty = qty
@@ -169,7 +201,7 @@ class EmaPopPullbackHoldOptionsStrategy:
                 direction=direction,
                 entry_underlying=entry_underlying,
                 entry_option=entry_option,
-                stop_price=0.0,
+                stop_price=recovered_stop_price,
                 original_qty=original_qty,
                 remaining_qty=qty,
                 trimmed=trimmed,
@@ -570,6 +602,7 @@ class EmaPopPullbackHoldOptionsStrategy:
         profit = None
         profit_pct = None
         target_profit = None
+        runner_target_profit = None
         price_source = "mid"
 
         active_trades = None
@@ -600,6 +633,8 @@ class EmaPopPullbackHoldOptionsStrategy:
             if entry_value > 0:
                 profit_pct = (profit / entry_value) * 100
             target_profit = entry_value * target_pct
+            runner_entry_value = entry_option * 100 * max(1, trade.remaining_qty)
+            runner_target_profit = runner_entry_value * self.settings.pop_pullback_runner_target_profit_pct
 
         parts = [
             f"Trade status {trade.option_symbol}",
@@ -612,17 +647,31 @@ class EmaPopPullbackHoldOptionsStrategy:
                 parts.append(f"pnl=${profit:.2f} ({profit_pct:.2f}%)")
             if target_profit is not None:
                 parts.append(f"target=${target_profit:.2f}")
+            if trade.trimmed and runner_target_profit is not None:
+                parts.append(f"runner_target=${runner_target_profit:.2f}")
         else:
             parts.append("opt_px=NA")
 
         if zone_low is not None and zone_high is not None:
             parts.append(f"zone_low={zone_low:.2f} zone_high={zone_high:.2f}")
+        if trade.stop_price > 0:
+            parts.append(f"stop_price={trade.stop_price:.2f}")
         if active_trades is not None:
             parts.append(f"active_trades={active_trades}")
         if total_unrealized is not None:
             parts.append(f"total_unrealized=${total_unrealized:.2f}")
 
         log.info(" | ".join(parts))
+
+        # Entry-based hard stop on underlying
+        if trade.stop_price > 0:
+            if trade.direction == "call":
+                stop_hit = low_now <= trade.stop_price or close_now <= trade.stop_price
+            else:
+                stop_hit = high_now >= trade.stop_price or close_now >= trade.stop_price
+            if stop_hit:
+                self._exit_full(trade, reason="stop_price")
+                return
 
         # Zone-based exits (support/resistance)
         zone_stop = False
@@ -647,25 +696,21 @@ class EmaPopPullbackHoldOptionsStrategy:
         if not trade.trimmed:
             profit_on_underlying = self.settings.pop_pullback_profit_calc_on_underlying
             if profit_on_underlying:
-                current_price = close_now
+                target_price = close_now
                 entry_price = trade.entry_underlying
             else:
+                target_price = current_price
                 entry_price = trade.entry_option
 
             hit = zone_target
-            if current_price is not None and entry_price:
-                if profit_on_underlying:
-                    if trade.direction == "call":
-                        hit = hit or (current_price >= entry_price * (1 + target_pct))
-                    else:
-                        hit = hit or (current_price <= entry_price * (1 - target_pct))
-                else:
-                    # Use total trade profit in dollars (based on option premium)
-                    entry_value = entry_price * 100 * trade.original_qty
-                    current_value = current_price * 100 * trade.original_qty
-                    profit = current_value - entry_value
-                    target_profit = entry_value * target_pct
-                    hit = hit or (profit >= target_profit)
+            hit = hit or self._profit_target_hit(
+                direction=trade.direction,
+                current_price=target_price,
+                entry_price=entry_price,
+                target_pct=target_pct,
+                qty=trade.original_qty,
+                profit_on_underlying=profit_on_underlying,
+            )
 
             if hit:
                 trim_qty = int(trade.original_qty * 0.9)
@@ -680,10 +725,28 @@ class EmaPopPullbackHoldOptionsStrategy:
                     trade.remaining_qty -= trim_qty
                     trade.trimmed = True
 
-        # If already trimmed, zone target should exit the remainder
-        if trade.trimmed and zone_target:
-            self._exit_full(trade, reason="zone_target")
-            return
+        # Runner exit for remaining position: 11% target or EMA fallback.
+        if trade.trimmed:
+            runner_pct = self.settings.pop_pullback_runner_target_profit_pct
+            profit_on_underlying = self.settings.pop_pullback_profit_calc_on_underlying
+            if profit_on_underlying:
+                runner_price = close_now
+                runner_entry_price = trade.entry_underlying
+            else:
+                runner_price = current_price
+                runner_entry_price = trade.entry_option
+
+            runner_hit = self._profit_target_hit(
+                direction=trade.direction,
+                current_price=runner_price,
+                entry_price=runner_entry_price,
+                target_pct=runner_pct,
+                qty=max(1, trade.remaining_qty),
+                profit_on_underlying=profit_on_underlying,
+            )
+            if runner_hit:
+                self._exit_full(trade, reason="runner_target")
+                return
 
         # EMA exit for remaining position
         if trade.remaining_qty <= 0:

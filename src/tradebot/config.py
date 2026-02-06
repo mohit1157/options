@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     pop_pullback_stop_buffer: float = 0.0
     pop_pullback_stop_buffer_mode: str = "price"  # "price" or "percent"
     pop_pullback_target_profit_pct: float = 0.07
+    pop_pullback_runner_target_profit_pct: float = 0.11
     pop_pullback_entry_timeout_candles: int = 3
     pop_pullback_ema_exit_mode: str = "close"  # "close" or "intrabar"
     pop_pullback_profit_calc_on_underlying: bool = True
@@ -198,6 +199,13 @@ class Settings(BaseSettings):
             raise ValueError("pop_pullback_target_profit_pct must be in [0.06, 0.08]")
         return v
 
+    @field_validator("pop_pullback_runner_target_profit_pct")
+    @classmethod
+    def pop_pullback_runner_target_profit_range(cls, v: float) -> float:
+        if v <= 0 or v > 1:
+            raise ValueError("pop_pullback_runner_target_profit_pct must be in (0, 1]")
+        return v
+
     @field_validator("pop_pullback_entry_timeout_candles")
     @classmethod
     def pop_pullback_entry_timeout_positive(cls, v: int) -> int:
@@ -219,6 +227,15 @@ class Settings(BaseSettings):
         if v_lower not in ("close", "intrabar"):
             raise ValueError("pop_pullback_ema_exit_mode must be 'close' or 'intrabar'")
         return v_lower
+
+    @model_validator(mode="after")
+    def validate_pop_pullback_targets(self) -> "Settings":
+        if self.pop_pullback_runner_target_profit_pct <= self.pop_pullback_target_profit_pct:
+            raise ValueError(
+                "pop_pullback_runner_target_profit_pct must be greater than "
+                "pop_pullback_target_profit_pct"
+            )
+        return self
 
     @field_validator("symbols")
     @classmethod
