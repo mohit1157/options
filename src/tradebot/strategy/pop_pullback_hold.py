@@ -564,38 +564,50 @@ class EmaPopPullbackHoldOptionsStrategy:
         zone_high: Optional[float],
     ) -> None:
         # Snapshot PnL + portfolio status for logging
-        option_price = self._get_option_price(trade.option_symbol)
         entry_option = trade.entry_option
         target_pct = self.settings.pop_pullback_target_profit_pct
         entry_value = None
-        current_value = None
         profit = None
         profit_pct = None
         target_profit = None
-        if option_price is not None and entry_option:
-            entry_value = entry_option * 100 * trade.original_qty
-            current_value = option_price * 100 * trade.original_qty
-            profit = current_value - entry_value
-            if entry_value > 0:
-                profit_pct = (profit / entry_value) * 100
-            target_profit = entry_value * target_pct
+        price_source = "mid"
 
         active_trades = None
         total_unrealized = None
+        current_price = None
+        pos_unrealized = None
         try:
             positions = self.broker.list_positions()
             active_trades = len(positions)
             total_unrealized = sum(p.unrealized_pl for p in positions)
+            pos = next((p for p in positions if p.symbol == trade.option_symbol), None)
+            if pos and abs(pos.qty) > 0:
+                mark_px = abs(pos.market_value) / (abs(pos.qty) * 100)
+                if mark_px > 0:
+                    current_price = mark_px
+                    price_source = "mark"
+                    pos_unrealized = pos.unrealized_pl
         except Exception as e:
             log.debug(f"Status log: failed to fetch positions: {e}")
+
+        if current_price is None:
+            current_price = self._get_option_price(trade.option_symbol)
+            price_source = "mid"
+
+        if current_price is not None and entry_option:
+            entry_value = entry_option * 100 * trade.original_qty
+            profit = (pos_unrealized if pos_unrealized is not None else (current_price * 100 * trade.original_qty - entry_value))
+            if entry_value > 0:
+                profit_pct = (profit / entry_value) * 100
+            target_profit = entry_value * target_pct
 
         parts = [
             f"Trade status {trade.option_symbol}",
             f"dir={trade.direction}",
             f"qty={trade.remaining_qty}/{trade.original_qty}",
         ]
-        if option_price is not None and entry_option:
-            parts.append(f"opt_px={option_price:.2f} entry_px={entry_option:.2f}")
+        if current_price is not None and entry_option:
+            parts.append(f"opt_px={current_price:.2f}({price_source}) entry_px={entry_option:.2f}")
             if profit is not None and profit_pct is not None:
                 parts.append(f"pnl=${profit:.2f} ({profit_pct:.2f}%)")
             if target_profit is not None:
@@ -638,7 +650,6 @@ class EmaPopPullbackHoldOptionsStrategy:
                 current_price = close_now
                 entry_price = trade.entry_underlying
             else:
-                current_price = option_price
                 entry_price = trade.entry_option
 
             hit = zone_target
