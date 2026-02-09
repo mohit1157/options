@@ -11,8 +11,7 @@ class TestSettingsValidation:
 
     def test_default_values(self):
         """Test that default values are set correctly."""
-        with patch.dict(os.environ, {}, clear=True):
-            settings = Settings()
+        settings = Settings(_env_file=None)
 
         assert settings.alpaca_base_url == "https://paper-api.alpaca.markets"
         assert settings.alpaca_data_feed == "iex"
@@ -186,7 +185,7 @@ class TestSettingsFromEnvironment:
         }
 
         with patch.dict(os.environ, env, clear=True):
-            settings = Settings()
+            settings = Settings(_env_file=None)
 
         assert settings.alpaca_api_key == "test_key"
         assert settings.alpaca_api_secret == "test_secret"
