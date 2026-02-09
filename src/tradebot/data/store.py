@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from tradebot.core.logger import get_logger
 
@@ -128,6 +128,80 @@ class SQLiteStore:
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_trade_audit_symbol ON trade_audit(symbol);
+                """
+            )
+
+            # Signal features for feedback learning
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_features (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    strategy TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    timeframe TEXT,
+                    features TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_signal_features_strategy_time
+                ON signal_features(strategy, created_at);
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_signal_features_symbol
+                ON signal_features(symbol);
+                """
+            )
+
+            # Realized trade outcomes linked to originating signals
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_outcomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    closed_at TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    signal_id INTEGER,
+                    entry_price REAL,
+                    exit_price REAL,
+                    qty REAL NOT NULL,
+                    pnl_usd REAL NOT NULL,
+                    pnl_pct REAL,
+                    is_win INTEGER NOT NULL,
+                    metadata TEXT,
+                    FOREIGN KEY(signal_id) REFERENCES signal_features(id) ON DELETE SET NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_trade_outcomes_strategy_time
+                ON trade_outcomes(strategy, closed_at);
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_trade_outcomes_symbol
+                ON trade_outcomes(symbol);
+                """
+            )
+
+            # Last strategy calibration snapshot and stats
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_calibration (
+                    strategy TEXT PRIMARY KEY,
+                    last_calibrated_at TEXT NOT NULL,
+                    params TEXT,
+                    stats TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
 
@@ -383,6 +457,195 @@ class SQLiteStore:
                 "neutral_count": row[3] or 0,
                 "total_count": row[4] or 0,
             }
+
+    # Feedback learning methods
+    def log_signal_features(
+        self,
+        *,
+        strategy: str,
+        symbol: str,
+        side: str,
+        timeframe: Optional[str],
+        features: dict,
+        created_at: Optional[datetime] = None,
+    ) -> int:
+        """Persist input features for a strategy signal."""
+        timestamp = (created_at or datetime.now(timezone.utc)).isoformat()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO signal_features(created_at, strategy, symbol, side, timeframe, features)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    strategy,
+                    symbol,
+                    side,
+                    timeframe,
+                    json.dumps(features or {}),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def log_trade_outcome(
+        self,
+        *,
+        strategy: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        pnl_usd: float,
+        is_win: bool,
+        signal_id: Optional[int] = None,
+        entry_price: Optional[float] = None,
+        exit_price: Optional[float] = None,
+        pnl_pct: Optional[float] = None,
+        metadata: Optional[dict] = None,
+        closed_at: Optional[datetime] = None,
+    ) -> int:
+        """Persist a realized trade outcome for calibration and analytics."""
+        timestamp = (closed_at or datetime.now(timezone.utc)).isoformat()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO trade_outcomes(
+                    closed_at,
+                    strategy,
+                    symbol,
+                    side,
+                    signal_id,
+                    entry_price,
+                    exit_price,
+                    qty,
+                    pnl_usd,
+                    pnl_pct,
+                    is_win,
+                    metadata
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    strategy,
+                    symbol,
+                    side,
+                    signal_id,
+                    entry_price,
+                    exit_price,
+                    qty,
+                    pnl_usd,
+                    pnl_pct,
+                    1 if is_win else 0,
+                    json.dumps(metadata) if metadata else None,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def get_trade_outcome_stats(
+        self,
+        *,
+        strategy: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Aggregate win-rate and PnL stats from realized trade outcomes."""
+        query = """
+            SELECT
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+                AVG(pnl_usd) as avg_pnl_usd,
+                AVG(pnl_pct) as avg_pnl_pct,
+                SUM(pnl_usd) as total_pnl_usd
+            FROM trade_outcomes
+            WHERE 1=1
+        """
+        params: list[Any] = []
+
+        if strategy:
+            query += " AND strategy = ?"
+            params.append(strategy)
+        if since:
+            query += " AND closed_at >= ?"
+            params.append(since.isoformat())
+        if until:
+            query += " AND closed_at < ?"
+            params.append(until.isoformat())
+
+        with self.connect() as conn:
+            cur = conn.execute(query, params)
+            row = cur.fetchone()
+
+        total = int(row[0] or 0)
+        wins = int(row[1] or 0)
+        losses = max(0, total - wins)
+        win_rate = float(wins / total) if total > 0 else 0.0
+
+        return {
+            "total_trades": total,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "avg_pnl_usd": float(row[2] or 0.0),
+            "avg_pnl_pct": float(row[3] or 0.0),
+            "total_pnl_usd": float(row[4] or 0.0),
+        }
+
+    def get_last_calibration(self, *, strategy: str) -> Optional[dict[str, Any]]:
+        """Get the most recent calibration snapshot for a strategy."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT last_calibrated_at, params, stats
+                FROM strategy_calibration
+                WHERE strategy = ?
+                """,
+                (strategy,),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return None
+
+        try:
+            last_calibrated_at = datetime.fromisoformat(row[0])
+        except Exception:
+            last_calibrated_at = datetime.now(timezone.utc)
+
+        return {
+            "strategy": strategy,
+            "last_calibrated_at": last_calibrated_at,
+            "params": json.loads(row[1]) if row[1] else {},
+            "stats": json.loads(row[2]) if row[2] else {},
+        }
+
+    def upsert_calibration(
+        self,
+        *,
+        strategy: str,
+        last_calibrated_at: datetime,
+        params: Optional[dict] = None,
+        stats: Optional[dict] = None,
+    ) -> None:
+        """Upsert strategy calibration state."""
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_calibration(strategy, last_calibrated_at, params, stats, updated_at)
+                VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(strategy) DO UPDATE SET
+                    last_calibrated_at=excluded.last_calibrated_at,
+                    params=excluded.params,
+                    stats=excluded.stats,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    strategy,
+                    last_calibrated_at.isoformat(),
+                    json.dumps(params or {}),
+                    json.dumps(stats or {}),
+                ),
+            )
 
     # Trade audit methods
     def log_trade(
