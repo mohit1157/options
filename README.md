@@ -144,3 +144,20 @@ These are configurable via env vars (see `src/tradebot/config.py`).
 
 Additional options selection knobs:
 - `OPTION_DTE_MAX`, `OPTION_STRIKE_TOLERANCE`, `OPTION_ORDER_QTY`, `OPTION_USE_DYNAMIC_QTY`
+
+## Screenshot Strategy Boilerplate
+This repo now includes a baseline pipeline for screenshot-labeled trade datasets:
+
+- Loader + schema: `src/tradebot/learning/screenshot_strategy.py`
+- Baseline model: `ScreenshotOutcomeModel`
+- Training CLI: `scripts/screenshot_strategy_train.py`
+- Data template: `examples/screenshot_trades_template.json`
+- Notes: `docs/screenshot_strategy_base.md`
+
+Train the baseline model:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/screenshot_strategy_train.py \
+  --data examples/screenshot_trades_template.json \
+  --model-out artifacts/screenshot_strategy_model.json
+```

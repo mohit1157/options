@@ -1,0 +1,53 @@
+{
+  "examples": [
+    {
+      "trade_id": "sample-001",
+      "screenshot_path": "examples/screenshots/sample_001.png",
+      "symbol": "SPY",
+      "timeframe": "3Min",
+      "side": "call",
+      "entry_price": 2.15,
+      "exit_price": 2.46,
+      "entry_time": "2026-02-03T14:36:00+00:00",
+      "exit_time": "2026-02-03T14:48:00+00:00",
+      "entry_bar_index": 123,
+      "exit_bar_index": 127,
+      "pattern": "pop_pullback_hold",
+      "tags": ["trend_day", "ema_reclaim", "volume_spike"],
+      "rationale": "Pop above EMA, clean pullback hold, then break of confirmation high.",
+      "manual_features": {
+        "ema_distance_pct": 0.0042,
+        "volume_ratio": 1.8,
+        "range_expansion_pct": 0.012
+      },
+      "metadata": {
+        "session": "open",
+        "notes": "clean continuation setup"
+      }
+    },
+    {
+      "trade_id": "sample-002",
+      "screenshot_path": "examples/screenshots/sample_002.png",
+      "symbol": "QQQ",
+      "timeframe": "3Min",
+      "side": "put",
+      "entry_price": 1.9,
+      "exit_price": 1.55,
+      "entry_time": "2026-02-04T15:12:00+00:00",
+      "exit_time": "2026-02-04T15:27:00+00:00",
+      "entry_bar_index": 212,
+      "exit_bar_index": 217,
+      "pattern": "rejection_fade",
+      "tags": ["resistance_reject", "weak_bounce"],
+      "rationale": "Multiple rejection wicks at resistance and loss of intraday VWAP.",
+      "manual_features": {
+        "ema_distance_pct": -0.0031,
+        "volume_ratio": 1.25
+      },
+      "metadata": {
+        "session": "midday"
+      }
+    }
+  ]
+}
+
