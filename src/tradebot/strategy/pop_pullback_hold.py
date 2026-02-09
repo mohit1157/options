@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import re
-from typing import Optional, Dict, List, Tuple
+from typing import ClassVar, Optional, Dict, List, Tuple
 
 from tradebot.config import Settings
 from tradebot.core.logger import get_logger
@@ -44,12 +44,20 @@ class TradeState:
     stop_price: float
     original_qty: int
     remaining_qty: int
+    signal_id: Optional[int] = None
+    opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    realized_pnl_usd: float = 0.0
     trimmed: bool = False
 
 
 @dataclass
 class EmaPopPullbackHoldOptionsStrategy:
     """3-Min 9 EMA Pop Pullback Hold Confirmation Strategy for options."""
+
+    CALIBRATION_STRATEGY: ClassVar[str] = "pop_pullback_hold"
+    CALIBRATION_LOOKBACK_DAYS: ClassVar[int] = 7
+    CALIBRATION_MIN_TRADES: ClassVar[int] = 8
+    CALIBRATION_CHECK_INTERVAL_HOURS: ClassVar[int] = 12
 
     settings: Settings
     broker: AlpacaBroker
@@ -63,6 +71,9 @@ class EmaPopPullbackHoldOptionsStrategy:
     _last_bar_time: Dict[str, datetime] = field(default_factory=dict, init=False)
     _active_trades: Dict[str, TradeState] = field(default_factory=dict, init=False)
     _recovered_symbols: set[str] = field(default_factory=set, init=False)
+    _adaptive_target_profit_pct: Optional[float] = field(default=None, init=False)
+    _adaptive_runner_target_profit_pct: Optional[float] = field(default=None, init=False)
+    _last_calibration_check: Optional[datetime] = field(default=None, init=False)
 
     def _get_contracts_client(self) -> AlpacaOptionsContractsClient:
         if self._contracts_client is None:
@@ -90,6 +101,95 @@ class EmaPopPullbackHoldOptionsStrategy:
         if self.settings.pop_pullback_stop_buffer_mode == "percent":
             return base_price * self.settings.pop_pullback_stop_buffer
         return self.settings.pop_pullback_stop_buffer
+
+    def _current_target_profit_pct(self) -> float:
+        if self._adaptive_target_profit_pct is not None:
+            return self._adaptive_target_profit_pct
+        return self.settings.pop_pullback_target_profit_pct
+
+    def _current_runner_target_profit_pct(self) -> float:
+        if self._adaptive_runner_target_profit_pct is not None:
+            return self._adaptive_runner_target_profit_pct
+        return self.settings.pop_pullback_runner_target_profit_pct
+
+    def _maybe_recalibrate_thresholds(self) -> None:
+        """Recalibrate target thresholds weekly from realized outcomes."""
+        now = datetime.now(timezone.utc)
+
+        if self._last_calibration_check is not None:
+            elapsed = now - self._last_calibration_check
+            if elapsed < timedelta(hours=self.CALIBRATION_CHECK_INTERVAL_HOURS):
+                return
+        self._last_calibration_check = now
+
+        last = self.store.get_last_calibration(strategy=self.CALIBRATION_STRATEGY)
+        if last:
+            last_time = last.get("last_calibrated_at")
+            if isinstance(last_time, datetime):
+                if last_time.tzinfo is None:
+                    last_time = last_time.replace(tzinfo=timezone.utc)
+                if now - last_time < timedelta(days=self.CALIBRATION_LOOKBACK_DAYS):
+                    params = last.get("params") if isinstance(last.get("params"), dict) else {}
+                    if "target_profit_pct" in params:
+                        self._adaptive_target_profit_pct = float(params["target_profit_pct"])
+                    if "runner_target_profit_pct" in params:
+                        self._adaptive_runner_target_profit_pct = float(params["runner_target_profit_pct"])
+                    return
+
+        since = now - timedelta(days=self.CALIBRATION_LOOKBACK_DAYS)
+        stats = self.store.get_trade_outcome_stats(
+            strategy=self.CALIBRATION_STRATEGY,
+            since=since,
+        )
+        total_trades = int(stats.get("total_trades", 0) or 0)
+
+        target = self._current_target_profit_pct()
+        runner = self._current_runner_target_profit_pct()
+        min_target, max_target = 0.06, 0.08
+        min_runner_gap = 0.02
+        max_runner = 0.25
+        adjusted = False
+
+        if total_trades >= self.CALIBRATION_MIN_TRADES:
+            win_rate = float(stats.get("win_rate", 0.0) or 0.0)
+            avg_pnl_pct = float(stats.get("avg_pnl_pct", 0.0) or 0.0)
+
+            if win_rate < 0.45 or avg_pnl_pct < 0:
+                target = max(min_target, round(target - 0.005, 4))
+                runner = max(target + min_runner_gap, round(runner - 0.01, 4))
+                adjusted = True
+            elif win_rate > 0.58 and avg_pnl_pct > 0.03:
+                target = min(max_target, round(target + 0.005, 4))
+                runner = min(max_runner, round(max(target + min_runner_gap, runner + 0.01), 4))
+                adjusted = True
+
+        runner = round(max(target + min_runner_gap, runner), 4)
+        target = round(target, 4)
+
+        self._adaptive_target_profit_pct = target
+        self._adaptive_runner_target_profit_pct = runner
+
+        self.store.upsert_calibration(
+            strategy=self.CALIBRATION_STRATEGY,
+            last_calibrated_at=now,
+            params={
+                "target_profit_pct": target,
+                "runner_target_profit_pct": runner,
+            },
+            stats={
+                **stats,
+                "adjusted": adjusted,
+                "lookback_days": self.CALIBRATION_LOOKBACK_DAYS,
+                "min_trades": self.CALIBRATION_MIN_TRADES,
+            },
+        )
+
+        if adjusted:
+            log.info(
+                f"Recalibrated thresholds: target={target:.4f}, runner={runner:.4f}, "
+                f"win_rate={float(stats.get('win_rate', 0.0)):.2%}, "
+                f"avg_pnl_pct={float(stats.get('avg_pnl_pct', 0.0)):.4f}"
+            )
 
     def _profit_target_hit(
         self,
@@ -228,6 +328,8 @@ class EmaPopPullbackHoldOptionsStrategy:
         except Exception as e:
             log.error(f"Failed to get account info: {e}")
             return
+
+        self._maybe_recalibrate_thresholds()
 
         # Recover an open trade if bot restarted and an options position exists
         if not self._active_trades:
@@ -548,6 +650,33 @@ class EmaPopPullbackHoldOptionsStrategy:
             log.error(f"Entry order failed for {contract.symbol}: {e}")
             return
 
+        signal_features = {
+            "underlying": symbol,
+            "direction": direction,
+            "entry_underlying": entry_underlying,
+            "base_low": base_low,
+            "base_high": base_high,
+            "stop_price": stop_price,
+            "contract_symbol": contract.symbol,
+            "contract_type": contract.type,
+            "expiration": contract.expiration_date,
+            "strike": contract.strike_price,
+            "premium": premium,
+            "target_profit_pct": self._current_target_profit_pct(),
+            "runner_target_profit_pct": self._current_runner_target_profit_pct(),
+            "stop_buffer": self.settings.pop_pullback_stop_buffer,
+            "stop_buffer_mode": self.settings.pop_pullback_stop_buffer_mode,
+            "equity": equity,
+            "qty": qty,
+        }
+        signal_id = self.store.log_signal_features(
+            strategy=self.CALIBRATION_STRATEGY,
+            symbol=contract.symbol,
+            side="buy",
+            timeframe="3Min",
+            features=signal_features,
+        )
+
         self.store.log_trade(
             symbol=contract.symbol,
             side="buy",
@@ -563,7 +692,8 @@ class EmaPopPullbackHoldOptionsStrategy:
                 "expiration": contract.expiration_date,
                 "strike": contract.strike_price,
                 "premium": premium,
-                "strategy": "pop_pullback_hold",
+                "strategy": self.CALIBRATION_STRATEGY,
+                "signal_id": signal_id,
             },
         )
 
@@ -576,6 +706,7 @@ class EmaPopPullbackHoldOptionsStrategy:
             stop_price=stop_price,
             original_qty=int(qty),
             remaining_qty=int(qty),
+            signal_id=signal_id,
             trimmed=False,
         )
 
@@ -597,7 +728,8 @@ class EmaPopPullbackHoldOptionsStrategy:
     ) -> None:
         # Snapshot PnL + portfolio status for logging
         entry_option = trade.entry_option
-        target_pct = self.settings.pop_pullback_target_profit_pct
+        target_pct = self._current_target_profit_pct()
+        runner_pct = self._current_runner_target_profit_pct()
         entry_value = None
         profit = None
         profit_pct = None
@@ -634,7 +766,7 @@ class EmaPopPullbackHoldOptionsStrategy:
                 profit_pct = (profit / entry_value) * 100
             target_profit = entry_value * target_pct
             runner_entry_value = entry_option * 100 * max(1, trade.remaining_qty)
-            runner_target_profit = runner_entry_value * self.settings.pop_pullback_runner_target_profit_pct
+            runner_target_profit = runner_entry_value * runner_pct
 
         parts = [
             f"Trade status {trade.option_symbol}",
@@ -670,7 +802,7 @@ class EmaPopPullbackHoldOptionsStrategy:
             else:
                 stop_hit = high_now >= trade.stop_price or close_now >= trade.stop_price
             if stop_hit:
-                self._exit_full(trade, reason="stop_price")
+                self._exit_full(trade, reason="stop_price", estimated_price=current_price)
                 return
 
         # Zone-based exits (support/resistance)
@@ -689,7 +821,7 @@ class EmaPopPullbackHoldOptionsStrategy:
                     zone_target = True
 
         if zone_stop:
-            self._exit_full(trade, reason="zone_stop")
+            self._exit_full(trade, reason="zone_stop", estimated_price=current_price)
             return
 
         # Partial profit target
@@ -715,19 +847,18 @@ class EmaPopPullbackHoldOptionsStrategy:
             if hit:
                 trim_qty = int(trade.original_qty * 0.9)
                 if trim_qty < 1:
-                    self._exit_full(trade, reason="target")
+                    self._exit_full(trade, reason="target", estimated_price=current_price)
                     return
                 if trim_qty >= trade.remaining_qty:
-                    self._exit_full(trade, reason="target")
+                    self._exit_full(trade, reason="target", estimated_price=current_price)
                     return
 
-                if self._exit_partial(trade, trim_qty, reason="target"):
+                if self._exit_partial(trade, trim_qty, reason="target", estimated_price=current_price):
                     trade.remaining_qty -= trim_qty
                     trade.trimmed = True
 
         # Runner exit for remaining position: 11% target or EMA fallback.
         if trade.trimmed:
-            runner_pct = self.settings.pop_pullback_runner_target_profit_pct
             profit_on_underlying = self.settings.pop_pullback_profit_calc_on_underlying
             if profit_on_underlying:
                 runner_price = close_now
@@ -745,12 +876,12 @@ class EmaPopPullbackHoldOptionsStrategy:
                 profit_on_underlying=profit_on_underlying,
             )
             if runner_hit:
-                self._exit_full(trade, reason="runner_target")
+                self._exit_full(trade, reason="runner_target", estimated_price=current_price)
                 return
 
         # EMA exit for remaining position
         if trade.remaining_qty <= 0:
-            self._exit_full(trade, reason="position_empty")
+            self._exit_full(trade, reason="position_empty", estimated_price=current_price)
             return
 
         ema_exit_mode = self.settings.pop_pullback_ema_exit_mode
@@ -766,7 +897,7 @@ class EmaPopPullbackHoldOptionsStrategy:
                 crossed = high_now > ema_now
 
         if crossed:
-            self._exit_full(trade, reason="ema_exit")
+            self._exit_full(trade, reason="ema_exit", estimated_price=current_price)
 
     def _get_option_price(self, symbol: str) -> Optional[float]:
         try:
@@ -774,7 +905,30 @@ class EmaPopPullbackHoldOptionsStrategy:
         except Exception:
             return None
 
-    def _exit_partial(self, trade: TradeState, qty: int, reason: str) -> bool:
+    def _estimate_realized_pnl(
+        self,
+        *,
+        entry_price: Optional[float],
+        exit_price: Optional[float],
+        qty: int,
+    ) -> float:
+        if qty <= 0:
+            return 0.0
+        if entry_price is None or exit_price is None:
+            return 0.0
+        return (exit_price - entry_price) * 100 * qty
+
+    def _exit_partial(
+        self,
+        trade: TradeState,
+        qty: int,
+        reason: str,
+        estimated_price: Optional[float] = None,
+    ) -> bool:
+        if qty <= 0:
+            return False
+
+        exit_price = estimated_price if estimated_price is not None else self._get_option_price(trade.option_symbol)
         try:
             order_id = self.broker.place_order(
                 OrderRequest(symbol=trade.option_symbol, side="sell", qty=qty)
@@ -789,9 +943,16 @@ class EmaPopPullbackHoldOptionsStrategy:
                 metadata={
                     "underlying": trade.underlying,
                     "reason": reason,
-                    "strategy": "pop_pullback_hold",
+                    "strategy": self.CALIBRATION_STRATEGY,
                     "partial": True,
+                    "signal_id": trade.signal_id,
+                    "estimated_exit_price": exit_price,
                 },
+            )
+            trade.realized_pnl_usd += self._estimate_realized_pnl(
+                entry_price=trade.entry_option,
+                exit_price=exit_price,
+                qty=qty,
             )
             log.info(f"Partial exit {trade.option_symbol} qty={qty} reason={reason}")
             return True
@@ -799,12 +960,19 @@ class EmaPopPullbackHoldOptionsStrategy:
             log.error(f"Partial exit failed for {trade.option_symbol}: {e}")
             return False
 
-    def _exit_full(self, trade: TradeState, reason: str) -> None:
+    def _exit_full(
+        self,
+        trade: TradeState,
+        reason: str,
+        estimated_price: Optional[float] = None,
+    ) -> None:
         qty = trade.remaining_qty
         if qty <= 0:
             self._active_trades.pop(trade.option_symbol, None)
             return
 
+        exit_price = estimated_price if estimated_price is not None else self._get_option_price(trade.option_symbol)
+        closed = False
         try:
             order_id = self.broker.place_order(
                 OrderRequest(symbol=trade.option_symbol, side="sell", qty=qty)
@@ -819,12 +987,48 @@ class EmaPopPullbackHoldOptionsStrategy:
                 metadata={
                     "underlying": trade.underlying,
                     "reason": reason,
-                    "strategy": "pop_pullback_hold",
+                    "strategy": self.CALIBRATION_STRATEGY,
                     "partial": False,
+                    "signal_id": trade.signal_id,
+                    "estimated_exit_price": exit_price,
                 },
             )
+            closed = True
             log.info(f"Full exit {trade.option_symbol} qty={qty} reason={reason}")
         except Exception as e:
             log.error(f"Full exit failed for {trade.option_symbol}: {e}")
         finally:
+            if closed:
+                realized_final_leg = self._estimate_realized_pnl(
+                    entry_price=trade.entry_option,
+                    exit_price=exit_price,
+                    qty=qty,
+                )
+                realized_pnl_usd = trade.realized_pnl_usd + realized_final_leg
+                entry_notional = (
+                    trade.entry_option * 100 * trade.original_qty
+                    if trade.entry_option is not None and trade.original_qty > 0
+                    else 0.0
+                )
+                pnl_pct = (realized_pnl_usd / entry_notional) if entry_notional > 0 else None
+                self.store.log_trade_outcome(
+                    strategy=self.CALIBRATION_STRATEGY,
+                    symbol=trade.option_symbol,
+                    side="buy",
+                    qty=trade.original_qty,
+                    pnl_usd=realized_pnl_usd,
+                    pnl_pct=pnl_pct,
+                    is_win=realized_pnl_usd > 0,
+                    signal_id=trade.signal_id,
+                    entry_price=trade.entry_option,
+                    exit_price=exit_price,
+                    closed_at=datetime.now(timezone.utc),
+                    metadata={
+                        "underlying": trade.underlying,
+                        "direction": trade.direction,
+                        "reason": reason,
+                        "trimmed": trade.trimmed,
+                        "opened_at": trade.opened_at.isoformat(),
+                    },
+                )
             self._active_trades.pop(trade.option_symbol, None)

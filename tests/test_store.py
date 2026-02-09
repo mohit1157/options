@@ -332,3 +332,59 @@ class TestSQLiteStore:
         assert "filled" in pnl
         assert "rejected" in pnl
         assert "errors" in pnl
+
+    def test_signal_features_and_trade_outcome_roundtrip(self, store: SQLiteStore):
+        """Test feedback-learning tables and stats aggregation."""
+        now = datetime.now(timezone.utc)
+        signal_id = store.log_signal_features(
+            strategy="pop_pullback_hold",
+            symbol="SPY250117C00500000",
+            side="buy",
+            timeframe="3Min",
+            features={"ema": 9, "entry_underlying": 500.0},
+            created_at=now,
+        )
+        assert signal_id > 0
+
+        store.log_trade_outcome(
+            strategy="pop_pullback_hold",
+            symbol="SPY250117C00500000",
+            side="buy",
+            qty=1,
+            pnl_usd=25.0,
+            pnl_pct=0.1,
+            is_win=True,
+            signal_id=signal_id,
+            entry_price=2.5,
+            exit_price=2.75,
+            closed_at=now,
+            metadata={"reason": "target"},
+        )
+
+        stats = store.get_trade_outcome_stats(
+            strategy="pop_pullback_hold",
+            since=now - timedelta(minutes=1),
+            until=now + timedelta(minutes=1),
+        )
+        assert stats["total_trades"] == 1
+        assert stats["wins"] == 1
+        assert stats["losses"] == 0
+        assert stats["win_rate"] == pytest.approx(1.0, rel=0.001)
+        assert stats["total_pnl_usd"] == pytest.approx(25.0, rel=0.001)
+        assert stats["avg_pnl_pct"] == pytest.approx(0.1, rel=0.001)
+
+    def test_calibration_state_roundtrip(self, store: SQLiteStore):
+        """Test storing and retrieving calibration state."""
+        now = datetime.now(timezone.utc)
+        store.upsert_calibration(
+            strategy="pop_pullback_hold",
+            last_calibrated_at=now,
+            params={"target_profit_pct": 0.07, "runner_target_profit_pct": 0.11},
+            stats={"total_trades": 12, "win_rate": 0.58},
+        )
+
+        calibration = store.get_last_calibration(strategy="pop_pullback_hold")
+        assert calibration is not None
+        assert calibration["strategy"] == "pop_pullback_hold"
+        assert calibration["params"]["target_profit_pct"] == pytest.approx(0.07, rel=0.001)
+        assert calibration["stats"]["total_trades"] == 12
