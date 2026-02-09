@@ -74,8 +74,10 @@ cp .env.example .env
 Then set:
 - `ALPACA_API_KEY` and `ALPACA_API_SECRET`
 - `ALPACA_BASE_URL` to the paper endpoint
-- Optional: `X_BEARER_TOKEN` for X API
-- Optional: `GROK_API_KEY` + `GROK_BASE_URL` (if you expose Grok inference via an endpoint)
+- `USE_SENTIMENT=false` for pure technical mode (default)
+- Optional (only when `USE_SENTIMENT=true`):
+  - `X_BEARER_TOKEN` for X API
+  - `GROK_API_KEY` + `GROK_BASE_URL` (if you expose Grok inference via an endpoint)
 
 ### 3) Run the bot
 ```bash
@@ -83,11 +85,11 @@ python -m tradebot.app run --paper
 ```
 
 ## How it works (high level)
-1. **Ingestion**
-   - RSS ingestor pulls items every N seconds and emits `NewsEvent`s.
-   - X ingestor (skeleton) is designed to fetch recent tweets for configured handles and emit `SocialEvent`s.
-2. **Sentiment**
-   - Events are routed through a `SentimentClient` implementation.
+1. **Ingestion (optional)**
+   - If `USE_SENTIMENT=true`, RSS ingestor pulls items every N seconds and emits `NewsEvent`s.
+   - If `USE_SENTIMENT=true`, X ingestor fetches recent tweets for configured handles and emits `SocialEvent`s.
+2. **Sentiment (optional)**
+   - If `USE_SENTIMENT=true`, events are routed through a `SentimentClient` implementation.
    - Default provided: `LocalRuleSentiment` (simple keyword scoring).
    - Plug-in provided: `GrokSentimentClient` (HTTP skeleton).
 3. **Strategy**

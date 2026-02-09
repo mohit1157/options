@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     ema_fast: int = 9
     ema_slow: int = 21
     sentiment_threshold: float = 0.15
+    use_sentiment: bool = False
 
     # Pop/Pullback EMA strategy parameters
     pop_pullback_ema_length: int = 9

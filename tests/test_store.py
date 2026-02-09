@@ -297,7 +297,7 @@ class TestSQLiteStore:
                 created_at=now,
                 author=None,
                 url=f"https://example.com/stats/{i}",
-                text="Test",
+                text=f"Test {i}",
             )
             store.add_sentiment(
                 event_id=event_id,

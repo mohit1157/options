@@ -11,13 +11,13 @@ class TestSettingsValidation:
 
     def test_default_values(self):
         """Test that default values are set correctly."""
-        with patch.dict(os.environ, {}, clear=True):
-            settings = Settings()
+        settings = Settings(_env_file=None)
 
         assert settings.alpaca_base_url == "https://paper-api.alpaca.markets"
         assert settings.alpaca_data_feed == "iex"
         assert settings.ema_fast == 9
         assert settings.ema_slow == 21
+        assert settings.use_sentiment is False
         assert settings.enable_options is False
 
     def test_ema_validation_fast_greater_than_slow(self):
@@ -182,15 +182,17 @@ class TestSettingsFromEnvironment:
             "SYMBOLS": "TSLA,NVDA",
             "EMA_FAST": "5",
             "EMA_SLOW": "15",
+            "USE_SENTIMENT": "true",
             "ENABLE_OPTIONS": "true",
         }
 
         with patch.dict(os.environ, env, clear=True):
-            settings = Settings()
+            settings = Settings(_env_file=None)
 
         assert settings.alpaca_api_key == "test_key"
         assert settings.alpaca_api_secret == "test_secret"
         assert settings.symbols == "TSLA,NVDA"
         assert settings.ema_fast == 5
         assert settings.ema_slow == 15
+        assert settings.use_sentiment is True
         assert settings.enable_options is True

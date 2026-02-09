@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import signal
-import sys
 import time
-from datetime import timedelta
 from typing import Optional
 
 import typer
@@ -133,10 +131,14 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
     store = SQLiteStore()
     store.init()
 
-    # Initialize sentiment client
-    sentiment_client = _make_sentiment(settings)
-    if hasattr(sentiment_client, "close"):
-        _register_cleanup(sentiment_client.close)
+    # Initialize sentiment client if enabled
+    sentiment_client: Optional[SentimentClient] = None
+    if settings.use_sentiment:
+        sentiment_client = _make_sentiment(settings)
+        if hasattr(sentiment_client, "close"):
+            _register_cleanup(sentiment_client.close)
+    else:
+        log.info("Sentiment disabled. Running technical-analysis-only mode.")
 
     # Initialize broker
     broker = AlpacaBroker(
@@ -151,12 +153,13 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
         _run_cleanup()
         raise typer.Exit(code=1)
 
-    if not _verify_grok_connection(sentiment_client):
-        # Fall back to local sentiment if Grok fails
-        if isinstance(sentiment_client, GrokSentimentClient):
-            sentiment_client.close()
-            sentiment_client = LocalRuleSentiment()
-            log.warning("Falling back to LocalRuleSentiment")
+    if settings.use_sentiment and sentiment_client is not None:
+        if not _verify_grok_connection(sentiment_client):
+            # Fall back to local sentiment if Grok fails
+            if isinstance(sentiment_client, GrokSentimentClient):
+                sentiment_client.close()
+                sentiment_client = LocalRuleSentiment()
+                log.warning("Falling back to LocalRuleSentiment")
 
     # Initialize risk manager
     risk = RiskManager(
@@ -187,7 +190,7 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
 
     # Initialize X client if configured
     x_client = None
-    if settings.x_bearer_token and settings.x_handles_list:
+    if settings.use_sentiment and settings.x_bearer_token and settings.x_handles_list:
         try:
             from tradebot.ingestion.x_client import XClient
             x_client = XClient(bearer_token=settings.x_bearer_token)
@@ -196,11 +199,16 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
         except Exception as e:
             log.warning(f"Failed to initialize X client: {e}")
     else:
-        log.info("X client not configured (no X_BEARER_TOKEN or X_HANDLES)")
+        if not settings.use_sentiment:
+            log.info("X client skipped (sentiment disabled)")
+        else:
+            log.info("X client not configured (no X_BEARER_TOKEN or X_HANDLES)")
 
     # Get circuit breakers for external services
     alpaca_breaker = get_circuit_breaker("alpaca", failure_threshold=5, recovery_timeout=60.0)
-    sentiment_breaker = get_circuit_breaker("sentiment", failure_threshold=3, recovery_timeout=30.0)
+    sentiment_breaker = None
+    if settings.use_sentiment:
+        sentiment_breaker = get_circuit_breaker("sentiment", failure_threshold=3, recovery_timeout=30.0)
 
     log.info(f"Bot started. Paper={paper}. Symbols={settings.symbols_list}. Timeframe={settings.timeframe}")
     log.info(f"Options trading: {'enabled' if settings.enable_options else 'disabled'}")
@@ -213,7 +221,12 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
 
         try:
             # 1) RSS ingestion
-            if settings.rss_feeds_list:
+            if (
+                settings.use_sentiment
+                and sentiment_client is not None
+                and sentiment_breaker is not None
+                and settings.rss_feeds_list
+            ):
                 try:
                     events = fetch_rss_events(settings.rss_feeds_list)
                     new_events = 0
@@ -254,7 +267,13 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
                     log.warning(f"RSS ingestion error: {ex}")
 
             # 2) X/Twitter ingestion
-            if x_client and settings.x_handles_list:
+            if (
+                settings.use_sentiment
+                and sentiment_client is not None
+                and sentiment_breaker is not None
+                and x_client
+                and settings.x_handles_list
+            ):
                 try:
                     for handle in settings.x_handles_list:
                         try:
@@ -369,6 +388,7 @@ def validate():
         log.info(f"  Symbols: {settings.symbols_list}")
         log.info(f"  EMA: fast={settings.ema_fast}, slow={settings.ema_slow}")
         log.info(f"  Risk: max_loss=${settings.max_daily_loss_usd}, max_pos=${settings.max_position_value_usd}")
+        log.info(f"  Sentiment: {'enabled' if settings.use_sentiment else 'disabled'}")
         log.info(f"  Options: {'enabled' if settings.enable_options else 'disabled'}")
 
         # Check credentials
@@ -377,15 +397,19 @@ def validate():
         else:
             log.warning("  Alpaca: credentials NOT configured")
 
-        if settings.grok_api_key:
+        if settings.use_sentiment and settings.grok_api_key:
             log.info("  Grok: API key configured")
-        else:
+        elif settings.use_sentiment:
             log.info("  Grok: using local sentiment (no API key)")
-
-        if settings.x_bearer_token:
-            log.info(f"  X API: configured for handles {settings.x_handles_list}")
         else:
+            log.info("  Grok: skipped (sentiment disabled)")
+
+        if settings.use_sentiment and settings.x_bearer_token:
+            log.info(f"  X API: configured for handles {settings.x_handles_list}")
+        elif settings.use_sentiment:
             log.info("  X API: not configured")
+        else:
+            log.info("  X API: skipped (sentiment disabled)")
 
     except Exception as e:
         log.error(f"Configuration validation failed: {e}")

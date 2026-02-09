@@ -17,20 +17,20 @@ log = get_logger("strategy")
 
 @dataclass
 class EmaSentimentStrategy:
-    """EMA crossover strategy with sentiment gating.
+    """EMA crossover strategy with optional sentiment gating.
 
     This strategy:
     1. Monitors EMA crossovers (fast crossing slow)
-    2. Requires sentiment confirmation before trading
+    2. Optionally requires sentiment confirmation before trading
     3. Uses risk manager for position sizing and bracket orders
 
     Buy signal:
         - Fast EMA crosses above slow EMA
-        - Recent sentiment >= sentiment_threshold
+        - If enabled: Recent sentiment >= sentiment_threshold
 
     Sell signal:
         - Fast EMA crosses below slow EMA
-        - Recent sentiment <= -sentiment_threshold
+        - If enabled: Recent sentiment <= -sentiment_threshold
     """
 
     settings: Settings
@@ -69,12 +69,15 @@ class EmaSentimentStrategy:
 
         for symbol in self.settings.symbols_list:
             try:
-                sentiment = self._sentiment_gate(symbol)
-                log.info(f"{symbol} sentiment avg: {sentiment:.3f}")
+                sentiment = 0.0
+                if self.settings.use_sentiment:
+                    sentiment = self._sentiment_gate(symbol)
+                    log.info(f"{symbol} sentiment avg: {sentiment:.3f}")
                 self._process_symbol(
                     symbol=symbol,
                     equity=equity,
                     sentiment=sentiment,
+                    use_sentiment=self.settings.use_sentiment,
                 )
             except Exception as e:
                 log.error(f"Error processing {symbol}: {e}")
@@ -84,6 +87,7 @@ class EmaSentimentStrategy:
         symbol: str,
         equity: float,
         sentiment: float,
+        use_sentiment: bool,
     ) -> None:
         """Process a single symbol for trading signals."""
         # Cooldown check
@@ -135,20 +139,19 @@ class EmaSentimentStrategy:
         curr_diff = float(fast.iloc[-1] - slow.iloc[-1])
         price = float(close.iloc[-1])
 
+        bull_signal = prev_diff <= 0 and curr_diff > 0
+        bear_signal = prev_diff >= 0 and curr_diff < 0
+
+        if use_sentiment:
+            bull_signal = bull_signal and sentiment >= self.settings.sentiment_threshold
+            bear_signal = bear_signal and sentiment <= -self.settings.sentiment_threshold
+
         # BUY signal
-        if (
-            prev_diff <= 0
-            and curr_diff > 0
-            and sentiment >= self.settings.sentiment_threshold
-        ):
+        if bull_signal:
             self._place_buy_order(symbol, equity, price, sentiment)
 
         # SELL/Short signal
-        elif (
-            prev_diff >= 0
-            and curr_diff < 0
-            and sentiment <= -self.settings.sentiment_threshold
-        ):
+        elif bear_signal:
             self._place_sell_order(symbol, equity, price, sentiment)
 
     def _place_buy_order(
@@ -168,10 +171,16 @@ class EmaSentimentStrategy:
             return
 
         sl, tp = self.risk.bracket_prices(entry_price=price, side="buy")
-        log.info(
-            f"Signal BUY {symbol} qty={qty:.4f} price={price:.2f} "
-            f"SL={sl:.2f} TP={tp:.2f} sentiment={sentiment:.3f}"
-        )
+        if self.settings.use_sentiment:
+            log.info(
+                f"Signal BUY {symbol} qty={qty:.4f} price={price:.2f} "
+                f"SL={sl:.2f} TP={tp:.2f} sentiment={sentiment:.3f}"
+            )
+        else:
+            log.info(
+                f"Signal BUY {symbol} qty={qty:.4f} price={price:.2f} "
+                f"SL={sl:.2f} TP={tp:.2f}"
+            )
 
         try:
             order_id = self.broker.place_order(
@@ -185,6 +194,14 @@ class EmaSentimentStrategy:
             )
 
             # Log to audit
+            metadata = {
+                "price": price,
+                "stop_loss": sl,
+                "take_profit": tp,
+            }
+            if self.settings.use_sentiment:
+                metadata["sentiment"] = sentiment
+
             self.store.log_trade(
                 symbol=symbol,
                 side="buy",
@@ -192,12 +209,7 @@ class EmaSentimentStrategy:
                 order_type="bracket",
                 status="submitted",
                 order_id=order_id,
-                metadata={
-                    "price": price,
-                    "stop_loss": sl,
-                    "take_profit": tp,
-                    "sentiment": sentiment,
-                },
+                metadata=metadata,
             )
             log.info(f"Buy order submitted: {order_id}")
 
@@ -229,10 +241,16 @@ class EmaSentimentStrategy:
             return
 
         sl, tp = self.risk.bracket_prices(entry_price=price, side="sell")
-        log.info(
-            f"Signal SELL {symbol} qty={qty:.4f} price={price:.2f} "
-            f"SL={sl:.2f} TP={tp:.2f} sentiment={sentiment:.3f}"
-        )
+        if self.settings.use_sentiment:
+            log.info(
+                f"Signal SELL {symbol} qty={qty:.4f} price={price:.2f} "
+                f"SL={sl:.2f} TP={tp:.2f} sentiment={sentiment:.3f}"
+            )
+        else:
+            log.info(
+                f"Signal SELL {symbol} qty={qty:.4f} price={price:.2f} "
+                f"SL={sl:.2f} TP={tp:.2f}"
+            )
 
         try:
             order_id = self.broker.place_order(
@@ -246,6 +264,14 @@ class EmaSentimentStrategy:
             )
 
             # Log to audit
+            metadata = {
+                "price": price,
+                "stop_loss": sl,
+                "take_profit": tp,
+            }
+            if self.settings.use_sentiment:
+                metadata["sentiment"] = sentiment
+
             self.store.log_trade(
                 symbol=symbol,
                 side="sell",
@@ -253,12 +279,7 @@ class EmaSentimentStrategy:
                 order_type="bracket",
                 status="submitted",
                 order_id=order_id,
-                metadata={
-                    "price": price,
-                    "stop_loss": sl,
-                    "take_profit": tp,
-                    "sentiment": sentiment,
-                },
+                metadata=metadata,
             )
             log.info(f"Sell order submitted: {order_id}")
 
