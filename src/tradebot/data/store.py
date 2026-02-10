@@ -770,17 +770,29 @@ class SQLiteStore:
                 "errors": row[3] or 0,
             }
 
-    def get_last_trade_time(self, symbol: str) -> Optional[datetime]:
-        """Get the most recent trade timestamp for a symbol."""
+    def get_last_trade_time(
+        self,
+        symbol: str,
+        *,
+        valid_statuses: tuple[str, ...] = ("submitted", "filled"),
+    ) -> Optional[datetime]:
+        """Get the most recent trade timestamp for a symbol.
+
+        By default, only successful/active lifecycle statuses are considered.
+        This avoids cooldown being triggered by failed attempts.
+        """
+        placeholders = ", ".join("?" for _ in valid_statuses)
+        params = [symbol, *valid_statuses]
         with self.connect() as conn:
             cur = conn.execute(
-                """
+                f"""
                 SELECT timestamp FROM trade_audit
                 WHERE symbol = ?
+                  AND status IN ({placeholders})
                 ORDER BY timestamp DESC
                 LIMIT 1
                 """,
-                (symbol,),
+                params,
             )
             row = cur.fetchone()
             if not row:
@@ -790,21 +802,29 @@ class SQLiteStore:
             except Exception:
                 return None
 
-    def get_last_trade_time_for_underlying(self, underlying: str) -> Optional[datetime]:
+    def get_last_trade_time_for_underlying(
+        self,
+        underlying: str,
+        *,
+        valid_statuses: tuple[str, ...] = ("submitted", "filled"),
+    ) -> Optional[datetime]:
         """Get the most recent trade timestamp for an underlying symbol.
 
         Uses a metadata string match for options trades.
         """
         pattern = f'"underlying": "{underlying}"'
+        placeholders = ", ".join("?" for _ in valid_statuses)
+        params = [underlying, f"%{pattern}%", *valid_statuses]
         with self.connect() as conn:
             cur = conn.execute(
-                """
+                f"""
                 SELECT timestamp FROM trade_audit
-                WHERE symbol = ? OR metadata LIKE ?
+                WHERE (symbol = ? OR metadata LIKE ?)
+                  AND status IN ({placeholders})
                 ORDER BY timestamp DESC
                 LIMIT 1
                 """,
-                (underlying, f"%{pattern}%"),
+                params,
             )
             row = cur.fetchone()
             if not row:

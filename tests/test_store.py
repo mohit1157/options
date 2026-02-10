@@ -388,3 +388,58 @@ class TestSQLiteStore:
         assert calibration["strategy"] == "pop_pullback_hold"
         assert calibration["params"]["target_profit_pct"] == pytest.approx(0.07, rel=0.001)
         assert calibration["stats"]["total_trades"] == 12
+
+    def test_get_last_trade_time_ignores_error_status_by_default(self, store: SQLiteStore):
+        """Cooldown timestamp should ignore failed attempts by default."""
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        older_submitted = now - timedelta(minutes=10)
+
+        with store.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO trade_audit(timestamp, symbol, side, qty, order_type, status)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (older_submitted.isoformat(), "AAPL", "buy", 1.0, "market", "submitted"),
+            )
+            conn.execute(
+                """
+                INSERT INTO trade_audit(timestamp, symbol, side, qty, order_type, status, error_message)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (now.isoformat(), "AAPL", "buy", 1.0, "market", "error", "boom"),
+            )
+
+        last = store.get_last_trade_time("AAPL")
+        assert last is not None
+        assert last == older_submitted
+
+        # If requested, error can still be included.
+        last_with_error = store.get_last_trade_time("AAPL", valid_statuses=("submitted", "error"))
+        assert last_with_error == now
+
+    def test_get_last_trade_time_for_underlying_ignores_error_by_default(self, store: SQLiteStore):
+        """Underlying cooldown should ignore error rows by default."""
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        older_submitted = now - timedelta(minutes=15)
+        metadata = '{"underlying": "AAPL"}'
+
+        with store.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO trade_audit(timestamp, symbol, side, qty, order_type, status, metadata)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (older_submitted.isoformat(), "AAPL260101C00100000", "buy", 1.0, "market", "submitted", metadata),
+            )
+            conn.execute(
+                """
+                INSERT INTO trade_audit(timestamp, symbol, side, qty, order_type, status, metadata, error_message)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (now.isoformat(), "AAPL260101C00100000", "buy", 1.0, "market", "error", metadata, "failed"),
+            )
+
+        last = store.get_last_trade_time_for_underlying("AAPL")
+        assert last is not None
+        assert last == older_submitted
