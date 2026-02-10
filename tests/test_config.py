@@ -17,6 +17,7 @@ class TestSettingsValidation:
         assert settings.alpaca_data_feed == "iex"
         assert settings.ema_fast == 9
         assert settings.ema_slow == 21
+        assert settings.enable_stocks is True
         assert settings.use_sentiment is False
         assert settings.enable_options is False
 
@@ -182,6 +183,7 @@ class TestSettingsFromEnvironment:
             "SYMBOLS": "TSLA,NVDA",
             "EMA_FAST": "5",
             "EMA_SLOW": "15",
+            "ENABLE_STOCKS": "false",
             "USE_SENTIMENT": "true",
             "ENABLE_OPTIONS": "true",
         }
@@ -194,5 +196,6 @@ class TestSettingsFromEnvironment:
         assert settings.symbols == "TSLA,NVDA"
         assert settings.ema_fast == 5
         assert settings.ema_slow == 15
+        assert settings.enable_stocks is False
         assert settings.use_sentiment is True
         assert settings.enable_options is True

@@ -211,6 +211,7 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
         sentiment_breaker = get_circuit_breaker("sentiment", failure_threshold=3, recovery_timeout=30.0)
 
     log.info(f"Bot started. Paper={paper}. Symbols={settings.symbols_list}. Timeframe={settings.timeframe}")
+    log.info(f"Stock trading: {'enabled' if settings.enable_stocks else 'disabled'}")
     log.info(f"Options trading: {'enabled' if settings.enable_options else 'disabled'}")
 
     # Main loop
@@ -327,7 +328,7 @@ def run(paper: bool = typer.Option(True, "--paper/--live", help="Use Alpaca pape
                     log.warning(f"X ingestion error: {ex}")
 
             # 3) Stock strategy tick
-            if not settings.market_open_only or broker.is_market_open():
+            if settings.enable_stocks and (not settings.market_open_only or broker.is_market_open()):
                 try:
                     alpaca_breaker.call(lambda: stock_strategy.tick())
                 except CircuitOpenError:
@@ -389,6 +390,7 @@ def validate():
         log.info(f"  EMA: fast={settings.ema_fast}, slow={settings.ema_slow}")
         log.info(f"  Risk: max_loss=${settings.max_daily_loss_usd}, max_pos=${settings.max_position_value_usd}")
         log.info(f"  Sentiment: {'enabled' if settings.use_sentiment else 'disabled'}")
+        log.info(f"  Stocks: {'enabled' if settings.enable_stocks else 'disabled'}")
         log.info(f"  Options: {'enabled' if settings.enable_options else 'disabled'}")
 
         # Check credentials
