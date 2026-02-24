@@ -74,6 +74,9 @@ class EmaPopPullbackHoldOptionsStrategy:
     _adaptive_target_profit_pct: Optional[float] = field(default=None, init=False)
     _adaptive_runner_target_profit_pct: Optional[float] = field(default=None, init=False)
     _last_calibration_check: Optional[datetime] = field(default=None, init=False)
+    _stopped_today: set[str] = field(default_factory=set, init=False)  # Underlyings stopped out today
+    _stopped_today_date: Optional[object] = field(default=None, init=False)
+    _eod_closed: bool = field(default=False, init=False)
 
     def _get_contracts_client(self) -> AlpacaOptionsContractsClient:
         if self._contracts_client is None:
@@ -328,6 +331,42 @@ class EmaPopPullbackHoldOptionsStrategy:
         except Exception as e:
             log.error(f"Failed to get account info: {e}")
             return
+
+        # --- Reset daily stop-out cooldown at start of new day ---
+        today = datetime.now(timezone.utc).date()
+        if self._stopped_today_date != today:
+            self._stopped_today.clear()
+            self._stopped_today_date = today
+            self._eod_closed = False
+
+        # --- EOD Close: liquidate all positions 15 min before market close ---
+        try:
+            clock = self.broker.client.get_clock()
+            if clock.is_open and clock.next_close:
+                from datetime import timezone as _tz
+                now_utc = datetime.now(timezone.utc)
+                close_utc = clock.next_close.astimezone(timezone.utc) if clock.next_close.tzinfo else clock.next_close.replace(tzinfo=timezone.utc)
+                minutes_to_close = (close_utc - now_utc).total_seconds() / 60
+
+                if minutes_to_close <= 15 and self._active_trades and not self._eod_closed:
+                    log.warning(f"EOD CLOSE: {minutes_to_close:.0f} min to close — liquidating all positions")
+                    for sym, trade in list(self._active_trades.items()):
+                        self._exit_full(trade, reason="eod_close", estimated_price=self._get_option_price(sym))
+                    self._eod_closed = True
+                    return
+
+                # No new entries within 30 min of close
+                if minutes_to_close <= 30:
+                    # Still manage existing trades, but skip new entries below
+                    self._maybe_recalibrate_thresholds()
+                    if not self._active_trades:
+                        self._recover_active_trades()
+                    # Only manage existing trades
+                    for symbol in self.settings.symbols_list:
+                        self._process_symbol(symbol, equity)
+                    return
+        except Exception as e:
+            log.debug(f"Clock check for EOD: {e}")
 
         self._maybe_recalibrate_thresholds()
 
@@ -586,6 +625,16 @@ class EmaPopPullbackHoldOptionsStrategy:
         if self._active_trades:
             return
 
+        # Max trades per day guard
+        if self.risk.max_trades_exceeded():
+            log.warning("Max trades per day reached, skipping new entry")
+            return
+
+        # Stop-out cooldown: don't re-enter same underlying after being stopped out today
+        if symbol in self._stopped_today:
+            log.info(f"{symbol} was stopped out today, skipping re-entry")
+            return
+
         # Guard against existing open positions/orders
         if self.broker.list_positions():
             log.info("Existing positions detected, skipping new entry")
@@ -619,9 +668,44 @@ class EmaPopPullbackHoldOptionsStrategy:
             log.warning(f"No suitable {preferred_type} contract for {symbol}")
             return
 
-        premium = contracts_client.get_latest_option_mid_price(contract.symbol)
+        # Fetch quote for spread check and limit price
+        quote = contracts_client.get_latest_option_quote(contract.symbol)
+        if quote:
+            bid = quote["bid"]
+            ask = quote["ask"]
 
-        if self.settings.option_use_dynamic_qty and premium:
+            # Spread check
+            if ask > 0:
+                spread_pct = (ask - bid) / ask
+                if spread_pct > self.settings.option_max_spread_pct:
+                    log.warning(
+                        f"Spread too wide for {contract.symbol}: {spread_pct:.2%} "
+                        f"(>{self.settings.option_max_spread_pct:.2%}). Bid={bid}, Ask={ask}. Skipping."
+                    )
+                    return
+            else:
+                log.warning(f"Invalid quote for {contract.symbol}: Bid={bid}, Ask={ask}. Skipping.")
+                return
+
+            premium = ask
+            limit_price = round(ask * (1 + self.settings.option_limit_buffer_pct), 2)
+        else:
+            # Fallback: use mid-price endpoint when quote API returns nothing
+            mid = contracts_client.get_latest_option_mid_price(contract.symbol)
+            if not mid or mid <= 0:
+                log.warning(f"No quote AND no mid-price for {contract.symbol}, skipping entry")
+                return
+            log.info(
+                f"No quote for {contract.symbol}, using mid-price fallback: ${mid:.2f} "
+                f"(spread check skipped)"
+            )
+            premium = mid
+            # Use mid + buffer as limit price (conservative since we don't know the ask)
+            limit_price = round(mid * (1 + self.settings.option_limit_buffer_pct * 2), 2)
+            bid = None
+            ask = None
+
+        if self.settings.option_use_dynamic_qty and premium > 0:
             qty = self.risk.calc_option_qty(
                 equity_usd=equity,
                 premium=premium,
@@ -644,11 +728,48 @@ class EmaPopPullbackHoldOptionsStrategy:
 
         try:
             order_id = self.broker.place_order(
-                OrderRequest(symbol=contract.symbol, side="buy", qty=qty)
+                OrderRequest(
+                    symbol=contract.symbol, 
+                    side="buy", 
+                    qty=qty,
+                    limit_price=limit_price
+                )
             )
         except Exception as e:
             log.error(f"Entry order failed for {contract.symbol}: {e}")
             return
+
+        # Fill verification: wait for order to fill (up to 15 seconds)
+        import time as _time
+        fill_price = None
+        for _attempt in range(15):
+            _time.sleep(1)
+            order_info = self.broker.get_order(order_id)
+            if order_info and order_info.get("status") in ("filled", "OrderStatus.FILLED"):
+                fill_price = order_info.get("filled_avg_price")
+                break
+            if order_info and order_info.get("status") in (
+                "canceled", "cancelled", "expired", "rejected",
+                "OrderStatus.CANCELED", "OrderStatus.EXPIRED", "OrderStatus.REJECTED",
+            ):
+                log.warning(f"Entry order {order_id} was {order_info['status']}, aborting trade")
+                return
+        else:
+            # Order did not fill in time — cancel it
+            log.warning(f"Entry order {order_id} not filled in 15s, cancelling")
+            try:
+                self.broker.cancel_order(order_id)
+            except Exception:
+                pass
+            return
+
+        # Use actual fill price instead of pre-trade estimate
+        if fill_price is not None:
+            premium = float(fill_price)
+            log.info(f"Order {order_id} filled at ${premium:.2f} (limit was ${limit_price:.2f})")
+
+        # Record trade for daily trade count
+        self.risk.record_trade()
 
         signal_features = {
             "underlying": symbol,
@@ -666,6 +787,9 @@ class EmaPopPullbackHoldOptionsStrategy:
             "runner_target_profit_pct": self._current_runner_target_profit_pct(),
             "stop_buffer": self.settings.pop_pullback_stop_buffer,
             "stop_buffer_mode": self.settings.pop_pullback_stop_buffer_mode,
+            "limit_price": limit_price,
+            "bid": bid,
+            "ask": ask,
             "equity": equity,
             "qty": qty,
         }
@@ -681,7 +805,7 @@ class EmaPopPullbackHoldOptionsStrategy:
             symbol=contract.symbol,
             side="buy",
             qty=qty,
-            order_type="market",
+            order_type="limit",
             status="submitted",
             order_id=order_id,
             metadata={
@@ -694,6 +818,9 @@ class EmaPopPullbackHoldOptionsStrategy:
                 "premium": premium,
                 "strategy": self.CALIBRATION_STRATEGY,
                 "signal_id": signal_id,
+                "limit_price": limit_price,
+                "bid": bid,
+                "ask": ask,
             },
         )
 
@@ -710,9 +837,11 @@ class EmaPopPullbackHoldOptionsStrategy:
             trimmed=False,
         )
 
+        ask_str = f"${ask:.2f}" if ask is not None else "N/A"
         log.info(
             f"Entered {direction.upper()} {contract.symbol} qty={qty} "
-            f"entry_underlying={entry_underlying:.2f} stop={stop_price:.2f}"
+            f"entry_underlying={entry_underlying:.2f} stop={stop_price:.2f} "
+            f"Limit=${limit_price:.2f} (Ask={ask_str})"
         )
 
     def _manage_trade(
@@ -824,24 +953,16 @@ class EmaPopPullbackHoldOptionsStrategy:
             self._exit_full(trade, reason="zone_stop", estimated_price=current_price)
             return
 
-        # Partial profit target
+        # Partial profit target (always based on option premium)
         if not trade.trimmed:
-            profit_on_underlying = self.settings.pop_pullback_profit_calc_on_underlying
-            if profit_on_underlying:
-                target_price = close_now
-                entry_price = trade.entry_underlying
-            else:
-                target_price = current_price
-                entry_price = trade.entry_option
-
             hit = zone_target
             hit = hit or self._profit_target_hit(
                 direction=trade.direction,
-                current_price=target_price,
-                entry_price=entry_price,
+                current_price=current_price,
+                entry_price=trade.entry_option,
                 target_pct=target_pct,
                 qty=trade.original_qty,
-                profit_on_underlying=profit_on_underlying,
+                profit_on_underlying=False,
             )
 
             if hit:
@@ -859,21 +980,13 @@ class EmaPopPullbackHoldOptionsStrategy:
 
         # Runner exit for remaining position: 11% target or EMA fallback.
         if trade.trimmed:
-            profit_on_underlying = self.settings.pop_pullback_profit_calc_on_underlying
-            if profit_on_underlying:
-                runner_price = close_now
-                runner_entry_price = trade.entry_underlying
-            else:
-                runner_price = current_price
-                runner_entry_price = trade.entry_option
-
             runner_hit = self._profit_target_hit(
                 direction=trade.direction,
-                current_price=runner_price,
-                entry_price=runner_entry_price,
+                current_price=current_price,
+                entry_price=trade.entry_option,
                 target_pct=runner_pct,
                 qty=max(1, trade.remaining_qty),
-                profit_on_underlying=profit_on_underlying,
+                profit_on_underlying=False,
             )
             if runner_hit:
                 self._exit_full(trade, reason="runner_target", estimated_price=current_price)
@@ -929,9 +1042,24 @@ class EmaPopPullbackHoldOptionsStrategy:
             return False
 
         exit_price = estimated_price if estimated_price is not None else self._get_option_price(trade.option_symbol)
+
+        # Use limit order on exit at bid price
+        exit_limit = None
+        try:
+            exit_quote = self._get_contracts_client().get_latest_option_quote(trade.option_symbol)
+            if exit_quote and exit_quote.get("bid") and exit_quote["bid"] > 0:
+                exit_limit = round(exit_quote["bid"], 2)
+        except Exception:
+            pass
+
         try:
             order_id = self.broker.place_order(
-                OrderRequest(symbol=trade.option_symbol, side="sell", qty=qty)
+                OrderRequest(
+                    symbol=trade.option_symbol,
+                    side="sell",
+                    qty=qty,
+                    limit_price=exit_limit,
+                )
             )
             self.store.log_trade(
                 symbol=trade.option_symbol,
@@ -972,10 +1100,25 @@ class EmaPopPullbackHoldOptionsStrategy:
             return
 
         exit_price = estimated_price if estimated_price is not None else self._get_option_price(trade.option_symbol)
+
+        # Use limit order on exit at bid price
+        exit_limit = None
+        try:
+            exit_quote = self._get_contracts_client().get_latest_option_quote(trade.option_symbol)
+            if exit_quote and exit_quote.get("bid") and exit_quote["bid"] > 0:
+                exit_limit = round(exit_quote["bid"], 2)
+        except Exception:
+            pass
+
         closed = False
         try:
             order_id = self.broker.place_order(
-                OrderRequest(symbol=trade.option_symbol, side="sell", qty=qty)
+                OrderRequest(
+                    symbol=trade.option_symbol,
+                    side="sell",
+                    qty=qty,
+                    limit_price=exit_limit,
+                )
             )
             self.store.log_trade(
                 symbol=trade.option_symbol,
@@ -1031,4 +1174,14 @@ class EmaPopPullbackHoldOptionsStrategy:
                         "opened_at": trade.opened_at.isoformat(),
                     },
                 )
-            self._active_trades.pop(trade.option_symbol, None)
+            if closed:
+                self._active_trades.pop(trade.option_symbol, None)
+                # Track stop-outs for cooldown
+                if "stop" in reason:
+                    self._stopped_today.add(trade.underlying)
+                    log.info(f"{trade.underlying} added to stop-out cooldown for today")
+            else:
+                log.error(
+                    f"ORPHANED POSITION: {trade.option_symbol} qty={trade.remaining_qty} "
+                    f"— exit failed, position still open. Will retry next tick."
+                )
