@@ -688,7 +688,7 @@ class EmaPopPullbackHoldOptionsStrategy:
                 return
 
             premium = ask
-            limit_price = round(ask * (1 + self.settings.option_limit_buffer_pct), 2)
+            limit_price = round(ask, 2)
         else:
             # Fallback: use mid-price endpoint when quote API returns nothing
             mid = contracts_client.get_latest_option_mid_price(contract.symbol)
@@ -700,8 +700,7 @@ class EmaPopPullbackHoldOptionsStrategy:
                 f"(spread check skipped)"
             )
             premium = mid
-            # Use mid + buffer as limit price (conservative since we don't know the ask)
-            limit_price = round(mid * (1 + self.settings.option_limit_buffer_pct * 2), 2)
+            limit_price = round(mid, 2)
             bid = None
             ask = None
 
@@ -726,41 +725,82 @@ class EmaPopPullbackHoldOptionsStrategy:
             base_price = base_high if base_high is not None else entry_underlying
             stop_price = base_price + self._stop_buffer_amount(base_price)
 
-        try:
-            order_id = self.broker.place_order(
-                OrderRequest(
-                    symbol=contract.symbol, 
-                    side="buy", 
-                    qty=qty,
-                    limit_price=limit_price
-                )
-            )
-        except Exception as e:
-            log.error(f"Entry order failed for {contract.symbol}: {e}")
-            return
-
-        # Fill verification: wait for order to fill (up to 15 seconds)
+        # Retry loop: attempt to fill at exact ask/mid, re-validate setup between retries
         import time as _time
+        MAX_ENTRY_ATTEMPTS = 3
         fill_price = None
-        for _attempt in range(15):
-            _time.sleep(1)
-            order_info = self.broker.get_order(order_id)
-            if order_info and order_info.get("status") in ("filled", "OrderStatus.FILLED"):
-                fill_price = order_info.get("filled_avg_price")
-                break
-            if order_info and order_info.get("status") in (
-                "canceled", "cancelled", "expired", "rejected",
-                "OrderStatus.CANCELED", "OrderStatus.EXPIRED", "OrderStatus.REJECTED",
-            ):
-                log.warning(f"Entry order {order_id} was {order_info['status']}, aborting trade")
-                return
-        else:
-            # Order did not fill in time — cancel it
-            log.warning(f"Entry order {order_id} not filled in 15s, cancelling")
+        order_id = None
+
+        for attempt in range(MAX_ENTRY_ATTEMPTS):
+            # On retry, fetch fresh ask price
+            if attempt > 0:
+                log.info(f"Retry {attempt}/{MAX_ENTRY_ATTEMPTS - 1}: fetching fresh quote for {contract.symbol}")
+                fresh_quote = contracts_client.get_latest_option_quote(contract.symbol)
+                if fresh_quote and fresh_quote.get("ask") and fresh_quote["ask"] > 0:
+                    limit_price = round(fresh_quote["ask"], 2)
+                    premium = fresh_quote["ask"]
+                    bid = fresh_quote["bid"]
+                    ask = fresh_quote["ask"]
+                else:
+                    fresh_mid = contracts_client.get_latest_option_mid_price(contract.symbol)
+                    if fresh_mid and fresh_mid > 0:
+                        limit_price = round(fresh_mid, 2)
+                        premium = fresh_mid
+                    else:
+                        log.warning(f"No fresh price for {contract.symbol} on retry, skipping")
+                        return
+
             try:
-                self.broker.cancel_order(order_id)
-            except Exception:
-                pass
+                order_id = self.broker.place_order(
+                    OrderRequest(
+                        symbol=contract.symbol,
+                        side="buy",
+                        qty=qty,
+                        limit_price=limit_price,
+                    )
+                )
+            except Exception as e:
+                log.error(f"Entry order failed for {contract.symbol}: {e}")
+                return
+
+            # Wait up to 15 seconds for fill
+            for _tick in range(15):
+                _time.sleep(1)
+                order_info = self.broker.get_order(order_id)
+                if order_info and order_info.get("status") in ("filled", "OrderStatus.FILLED"):
+                    fill_price = order_info.get("filled_avg_price")
+                    break
+                if order_info and order_info.get("status") in (
+                    "canceled", "cancelled", "expired", "rejected",
+                    "OrderStatus.CANCELED", "OrderStatus.EXPIRED", "OrderStatus.REJECTED",
+                ):
+                    log.warning(f"Entry order {order_id} was {order_info['status']}, aborting trade")
+                    return
+            else:
+                # Not filled in 15s - cancel
+                log.warning(f"Entry order {order_id} not filled in 15s (attempt {attempt + 1}/{MAX_ENTRY_ATTEMPTS}), cancelling")
+                try:
+                    self.broker.cancel_order(order_id)
+                except Exception:
+                    pass
+
+                # Last attempt - give up
+                if attempt >= MAX_ENTRY_ATTEMPTS - 1:
+                    log.warning(f"Max entry attempts reached for {contract.symbol}, skipping trade")
+                    return
+
+                # Re-validate: is the technical setup still valid?
+                if not self._is_setup_still_valid(symbol, direction, stop_price):
+                    log.info(f"Setup no longer valid for {symbol} after fill timeout, skipping trade")
+                    return
+
+                log.info(f"Setup still valid for {symbol}, retrying with fresh price")
+                continue
+
+            # Order was filled
+            break
+
+        if fill_price is None or order_id is None:
             return
 
         # Use actual fill price instead of pre-trade estimate
@@ -843,6 +883,37 @@ class EmaPopPullbackHoldOptionsStrategy:
             f"entry_underlying={entry_underlying:.2f} stop={stop_price:.2f} "
             f"Limit=${limit_price:.2f} (Ask={ask_str})"
         )
+
+    def _is_setup_still_valid(self, symbol: str, direction: str, stop_price: float) -> bool:
+        """Re-validate EMA setup after a failed fill attempt.
+
+        Fetches fresh 3-min bars and checks that the underlying is still
+        on the correct side of EMA and hasn't breached the stop.
+        """
+        try:
+            bars = fetch_bars(
+                self.settings.alpaca_api_key,
+                self.settings.alpaca_api_secret,
+                symbol=symbol,
+                timeframe="3Min",
+                limit=50,
+                feed=self.settings.alpaca_data_feed,
+            )
+            if bars.empty:
+                return False
+
+            closes = bars["close"]
+            ema_series = ema(closes, self.settings.pop_pullback_ema_length)
+            close_now = float(closes.iloc[-1])
+            ema_now = float(ema_series.iloc[-1])
+
+            if direction == "call":
+                return close_now > ema_now and close_now > stop_price
+            else:
+                return close_now < ema_now and close_now < stop_price
+        except Exception as e:
+            log.error(f"Setup re-validation failed for {symbol}: {e}")
+            return False
 
     def _manage_trade(
         self,
