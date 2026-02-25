@@ -1114,50 +1114,71 @@ class EmaPopPullbackHoldOptionsStrategy:
 
         exit_price = estimated_price if estimated_price is not None else self._get_option_price(trade.option_symbol)
 
-        # Use limit order on exit at bid price
-        exit_limit = None
-        try:
-            exit_quote = self._get_contracts_client().get_latest_option_quote(trade.option_symbol)
-            if exit_quote and exit_quote.get("bid") and exit_quote["bid"] > 0:
-                exit_limit = round(exit_quote["bid"], 2)
-        except Exception:
-            pass
+        import time as _time
+        contracts_client = self._get_contracts_client()
+        order_id = None
 
-        try:
-            order_id = self.broker.place_order(
-                OrderRequest(
+        while True:
+            # Get current bid price
+            exit_limit = None
+            try:
+                exit_quote = contracts_client.get_latest_option_quote(trade.option_symbol)
+                if exit_quote and exit_quote.get("bid") and exit_quote["bid"] > 0:
+                    exit_limit = round(exit_quote["bid"], 2)
+            except Exception:
+                pass
+
+            try:
+                order_id = self.broker.place_order(
+                    OrderRequest(
+                        symbol=trade.option_symbol,
+                        side="sell",
+                        qty=qty,
+                        limit_price=exit_limit,
+                    )
+                )
+            except Exception as e:
+                log.error(f"Partial exit order failed for {trade.option_symbol}: {e}")
+                return False
+
+            # Wait 2s for fill
+            _time.sleep(2)
+            order_info = self.broker.get_order(order_id)
+            if order_info and order_info.get("status") in ("filled", "OrderStatus.FILLED"):
+                fill_px = order_info.get("filled_avg_price")
+                if fill_px is not None:
+                    exit_price = float(fill_px)
+                self.store.log_trade(
                     symbol=trade.option_symbol,
                     side="sell",
                     qty=qty,
-                    limit_price=exit_limit,
+                    order_type="limit",
+                    status="filled",
+                    order_id=order_id,
+                    metadata={
+                        "underlying": trade.underlying,
+                        "reason": reason,
+                        "strategy": self.CALIBRATION_STRATEGY,
+                        "partial": True,
+                        "signal_id": trade.signal_id,
+                        "estimated_exit_price": exit_price,
+                    },
                 )
-            )
-            self.store.log_trade(
-                symbol=trade.option_symbol,
-                side="sell",
-                qty=qty,
-                order_type="market",
-                status="submitted",
-                order_id=order_id,
-                metadata={
-                    "underlying": trade.underlying,
-                    "reason": reason,
-                    "strategy": self.CALIBRATION_STRATEGY,
-                    "partial": True,
-                    "signal_id": trade.signal_id,
-                    "estimated_exit_price": exit_price,
-                },
-            )
-            trade.realized_pnl_usd += self._estimate_realized_pnl(
-                entry_price=trade.entry_option,
-                exit_price=exit_price,
-                qty=qty,
-            )
-            log.info(f"Partial exit {trade.option_symbol} qty={qty} reason={reason}")
-            return True
-        except Exception as e:
-            log.error(f"Partial exit failed for {trade.option_symbol}: {e}")
-            return False
+                trade.realized_pnl_usd += self._estimate_realized_pnl(
+                    entry_price=trade.entry_option,
+                    exit_price=exit_price,
+                    qty=qty,
+                )
+                log.info(f"Partial exit {trade.option_symbol} qty={qty} reason={reason} fill=${exit_price:.2f}")
+                return True
+
+            # Not filled — cancel and retry with fresh bid
+            log.info(f"Partial exit not filled in 2s (bid={exit_limit}), retrying with fresh bid")
+            try:
+                self.broker.cancel_order(order_id)
+            except Exception:
+                pass
+            _time.sleep(0.5)  # brief pause before retry
 
     def _exit_full(
         self,
@@ -1172,87 +1193,110 @@ class EmaPopPullbackHoldOptionsStrategy:
 
         exit_price = estimated_price if estimated_price is not None else self._get_option_price(trade.option_symbol)
 
-        # Use limit order on exit at bid price
-        exit_limit = None
-        try:
-            exit_quote = self._get_contracts_client().get_latest_option_quote(trade.option_symbol)
-            if exit_quote and exit_quote.get("bid") and exit_quote["bid"] > 0:
-                exit_limit = round(exit_quote["bid"], 2)
-        except Exception:
-            pass
-
+        import time as _time
+        contracts_client = self._get_contracts_client()
+        order_id = None
         closed = False
-        try:
-            order_id = self.broker.place_order(
-                OrderRequest(
+
+        while True:
+            # Get current bid price
+            exit_limit = None
+            try:
+                exit_quote = contracts_client.get_latest_option_quote(trade.option_symbol)
+                if exit_quote and exit_quote.get("bid") and exit_quote["bid"] > 0:
+                    exit_limit = round(exit_quote["bid"], 2)
+            except Exception:
+                pass
+
+            try:
+                order_id = self.broker.place_order(
+                    OrderRequest(
+                        symbol=trade.option_symbol,
+                        side="sell",
+                        qty=qty,
+                        limit_price=exit_limit,
+                    )
+                )
+            except Exception as e:
+                log.error(f"Full exit order failed for {trade.option_symbol}: {e}")
+                break
+
+            # Wait 2s for fill
+            _time.sleep(2)
+            order_info = self.broker.get_order(order_id)
+            if order_info and order_info.get("status") in ("filled", "OrderStatus.FILLED"):
+                fill_px = order_info.get("filled_avg_price")
+                if fill_px is not None:
+                    exit_price = float(fill_px)
+                self.store.log_trade(
                     symbol=trade.option_symbol,
                     side="sell",
                     qty=qty,
-                    limit_price=exit_limit,
-                )
-            )
-            self.store.log_trade(
-                symbol=trade.option_symbol,
-                side="sell",
-                qty=qty,
-                order_type="market",
-                status="submitted",
-                order_id=order_id,
-                metadata={
-                    "underlying": trade.underlying,
-                    "reason": reason,
-                    "strategy": self.CALIBRATION_STRATEGY,
-                    "partial": False,
-                    "signal_id": trade.signal_id,
-                    "estimated_exit_price": exit_price,
-                },
-            )
-            closed = True
-            log.info(f"Full exit {trade.option_symbol} qty={qty} reason={reason}")
-        except Exception as e:
-            log.error(f"Full exit failed for {trade.option_symbol}: {e}")
-        finally:
-            if closed:
-                realized_final_leg = self._estimate_realized_pnl(
-                    entry_price=trade.entry_option,
-                    exit_price=exit_price,
-                    qty=qty,
-                )
-                realized_pnl_usd = trade.realized_pnl_usd + realized_final_leg
-                entry_notional = (
-                    trade.entry_option * 100 * trade.original_qty
-                    if trade.entry_option is not None and trade.original_qty > 0
-                    else 0.0
-                )
-                pnl_pct = (realized_pnl_usd / entry_notional) if entry_notional > 0 else None
-                self.store.log_trade_outcome(
-                    strategy=self.CALIBRATION_STRATEGY,
-                    symbol=trade.option_symbol,
-                    side="buy",
-                    qty=trade.original_qty,
-                    pnl_usd=realized_pnl_usd,
-                    pnl_pct=pnl_pct,
-                    is_win=realized_pnl_usd > 0,
-                    signal_id=trade.signal_id,
-                    entry_price=trade.entry_option,
-                    exit_price=exit_price,
-                    closed_at=datetime.now(timezone.utc),
+                    order_type="limit",
+                    status="filled",
+                    order_id=order_id,
                     metadata={
                         "underlying": trade.underlying,
-                        "direction": trade.direction,
                         "reason": reason,
-                        "trimmed": trade.trimmed,
-                        "opened_at": trade.opened_at.isoformat(),
+                        "strategy": self.CALIBRATION_STRATEGY,
+                        "partial": False,
+                        "signal_id": trade.signal_id,
+                        "estimated_exit_price": exit_price,
                     },
                 )
-            if closed:
-                self._active_trades.pop(trade.option_symbol, None)
-                # Track stop-outs for cooldown
-                if "stop" in reason:
-                    self._stopped_today.add(trade.underlying)
-                    log.info(f"{trade.underlying} added to stop-out cooldown for today")
-            else:
-                log.error(
-                    f"ORPHANED POSITION: {trade.option_symbol} qty={trade.remaining_qty} "
-                    f"— exit failed, position still open. Will retry next tick."
-                )
+                closed = True
+                log.info(f"Full exit {trade.option_symbol} qty={qty} reason={reason} fill=${exit_price:.2f}")
+                break
+
+            # Not filled — cancel and retry with fresh bid
+            log.info(f"Full exit not filled in 2s (bid={exit_limit}), retrying with fresh bid")
+            try:
+                self.broker.cancel_order(order_id)
+            except Exception:
+                pass
+            _time.sleep(0.5)  # brief pause before retry
+
+        # Post-exit cleanup
+        if closed:
+            realized_final_leg = self._estimate_realized_pnl(
+                entry_price=trade.entry_option,
+                exit_price=exit_price,
+                qty=qty,
+            )
+            realized_pnl_usd = trade.realized_pnl_usd + realized_final_leg
+            entry_notional = (
+                trade.entry_option * 100 * trade.original_qty
+                if trade.entry_option is not None and trade.original_qty > 0
+                else 0.0
+            )
+            pnl_pct = (realized_pnl_usd / entry_notional) if entry_notional > 0 else None
+            self.store.log_trade_outcome(
+                strategy=self.CALIBRATION_STRATEGY,
+                symbol=trade.option_symbol,
+                side="buy",
+                qty=trade.original_qty,
+                pnl_usd=realized_pnl_usd,
+                pnl_pct=pnl_pct,
+                is_win=realized_pnl_usd > 0,
+                signal_id=trade.signal_id,
+                entry_price=trade.entry_option,
+                exit_price=exit_price,
+                closed_at=datetime.now(timezone.utc),
+                metadata={
+                    "underlying": trade.underlying,
+                    "direction": trade.direction,
+                    "reason": reason,
+                    "trimmed": trade.trimmed,
+                    "opened_at": trade.opened_at.isoformat(),
+                },
+            )
+            self._active_trades.pop(trade.option_symbol, None)
+            # Track stop-outs for cooldown
+            if "stop" in reason:
+                self._stopped_today.add(trade.underlying)
+                log.info(f"{trade.underlying} added to stop-out cooldown for today")
+        else:
+            log.error(
+                f"ORPHANED POSITION: {trade.option_symbol} qty={trade.remaining_qty} "
+                f"— exit failed, position still open. Will retry next tick."
+            )
